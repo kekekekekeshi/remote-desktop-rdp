@@ -52,7 +52,9 @@ public struct ResolutionPreset: Identifiable, Hashable {
         ResolutionPreset(width: 2560, height: 1600, name: "WQXGA"),
         ResolutionPreset(width: 3440, height: 1440, name: "带鱼屏 QHD"),
         ResolutionPreset(width: 3840, height: 1600),
-        // 4K
+        // 4K / 5K / 6K
         ResolutionPreset(width: 3840, height: 2160, name: "4K UHD"),
+        ResolutionPreset(width: 5120, height: 2880, name: "5K"),
+        ResolutionPreset(width: 6016, height: 3384, name: "6K"),
     ]
 }
