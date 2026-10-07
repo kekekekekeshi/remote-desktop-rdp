@@ -1,0 +1,4 @@
+module Cfreerdp [system] {
+    header "shim.h"
+    export *
+}
