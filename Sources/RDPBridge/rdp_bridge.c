@@ -1307,14 +1307,16 @@ void rdp_send_mouse_button(RdpSession *session, int button, bool down, uint16_t 
 
 void rdp_send_mouse_wheel(RdpSession *session, int delta, uint16_t x, uint16_t y)
 {
-    (void)x;
-    (void)y;
-
     if (!session || !session->lock_ready)
         return;
 
     /*
-     * RDP 滚轮事件的 x 字段承载「旋转量」而非坐标：一格 = 120。
+     * RDP 滚轮事件的「旋转量」编码在 pointerFlags 低 9 位（ROTATE_MASK 低 8 位
+     * + bit8 符号位），而不是 x 字段：一格 = 120，负向旋转按 9 位二进制补码
+     * 存放（低 8 位 = 0x100 - 步数）。服务端按此解析（mstsc 抓包：上滚
+     * flags=0x0278、下滚 flags=0x0388；FreeRDP 官方 macOS 客户端同款实现）。
+     * 若把步数放进 x 字段而 flags 低 8 位为 0，上滚会因旋转量为 0 被丢弃，
+     * 下滚则被解读为 -256 的巨幅旋转——表现为「只能下翻、不能上翻」。
      * 本 API 的 delta 单位为格，正值表示向上/向左。
      */
     int steps = delta * 120;
@@ -1325,11 +1327,14 @@ void rdp_send_mouse_wheel(RdpSession *session, int delta, uint16_t x, uint16_t y
     }
     if (steps > 0xFF)
         steps = 0xFF;
+    if (flags & PTR_FLAGS_WHEEL_NEGATIVE)
+        steps = 0x100 - steps;
+    flags |= (UINT16)steps;
 
     EnterCriticalSection(&session->lock);
     rdpInput *input = session_input(session);
     if (input)
-        freerdp_input_send_mouse_event(input, flags, (UINT16)steps, 0);
+        freerdp_input_send_mouse_event(input, flags, x, y);
     LeaveCriticalSection(&session->lock);
 }
 

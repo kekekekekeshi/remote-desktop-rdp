@@ -244,6 +244,25 @@ libfreerdp3 / libwinpr3 (Homebrew)
 swift run rdpbridge-cli cursor-check /tmp          # 像素级验证 over 合成 + 导出 PNG
 ```
 
+## 滚轮事件编码
+
+RDP 的滚轮事件（MS-RDPBCGR 2.2.8.1.1.3.1）有个反直觉之处：
+**旋转量不在 x/y 字段里，而是编码在 pointerFlags 的低 9 位** ——
+低 8 位是 ROTATE_MASK（一格 = 120），bit8 是符号位（PTR_FLAGS_WHEEL_NEGATIVE），
+负向旋转按 9 位二进制补码存放（低 8 位 = `0x100 − 步数`）。
+x/y 在滚轮事件中被服务端忽略，填真实指针坐标即可。
+
+| 方向 | pointerFlags |
+| --- | --- |
+| 上滚一格 | `0x0278`（PTR_FLAGS_WHEEL \| 120） |
+| 下滚一格 | `0x0388`（PTR_FLAGS_WHEEL \| PTR_FLAGS_WHEEL_NEGATIVE \| 0x88） |
+
+mstsc 抓包与 FreeRDP 官方 macOS 客户端（`MRDPView.m`）均按此编码。
+
+> 踩坑记录：早期实现把步数放进 x 字段、flags 低 8 位留空，
+> 结果上滚被服务端解读为「旋转量 0」直接丢弃，下滚被解读为 −256 的巨幅旋转而"碰巧可用" ——
+> 表现为**触摸板只能下翻、不能上翻**。修复见 `rdp_send_mouse_wheel`。
+
 ## 渲染后端
 
 画面渲染有两套可运行时切换的后端，在会话窗口的顶部抽屉里切换（选择会持久化）：
