@@ -101,6 +101,24 @@ public final class RDPRenderNSView: NSView {
         }
     }
 
+    /// 光标重绘合并。
+    ///
+    /// `mouseMoved` 一旦真的送达就是连续高频事件，而 `composited()` 每次都要复制
+    /// 整帧（1080p 约 8 MB）再呈现。这里把同一轮 runloop 内的多次移动合并成一次
+    /// 重绘：合成用的始终是光标合成器里的最新位置，观感不变。
+    /// 输入事件本身仍然逐条即时下发，不受影响。
+    private var cursorRedrawScheduled = false
+
+    private func scheduleCursorRedraw() {
+        guard !cursorRedrawScheduled else { return }
+        cursorRedrawScheduled = true
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            cursorRedrawScheduled = false
+            renderCompositedFrame()
+        }
+    }
+
     /// 切换渲染后端。
     ///
     /// 注意两点：
@@ -158,27 +176,52 @@ public final class RDPRenderNSView: NSView {
 
     // MARK: - 鼠标
 
+    /// 覆盖整个视图的鼠标跟踪区域：让 `mouseMoved` 在没有按键时也持续送达。
+    ///
+    /// NSView 默认收不到 NSMouseMoved：那条通路要求 `window.acceptsMouseMovedEvents`
+    /// 且视图是 first responder。本视图两者都靠不住——SwiftUI 宿主窗口不会打开该开关，
+    /// 而抽屉被操作时还会主动让出焦点（见 `RDPRenderView.suppressFocusGrab`）。
+    /// 跟踪区域是按视图生效的，两者都不依赖，远端的 hover（链接高亮、悬停菜单）
+    /// 因此无需先点一下就能跟手。
+    private var hoverTrackingArea: NSTrackingArea?
+
+    public override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+
+        if let hoverTrackingArea {
+            removeTrackingArea(hoverTrackingArea)
+        }
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseMoved, .activeAlways, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        hoverTrackingArea = area
+    }
+
     public override func mouseMoved(with event: NSEvent) {
         let (x, y) = remotePoint(from: event)
-        renderCompositedFrame() // 光标跟手，不必等新帧
+        scheduleCursorRedraw() // 光标跟手，不必等新帧
         onMouseMove?(x, y)
     }
 
     public override func mouseDragged(with event: NSEvent) {
         let (x, y) = remotePoint(from: event)
-        renderCompositedFrame() // 光标跟手，不必等新帧
+        scheduleCursorRedraw() // 光标跟手，不必等新帧
         onMouseMove?(x, y)
     }
 
     public override func rightMouseDragged(with event: NSEvent) {
         let (x, y) = remotePoint(from: event)
-        renderCompositedFrame() // 光标跟手，不必等新帧
+        scheduleCursorRedraw() // 光标跟手，不必等新帧
         onMouseMove?(x, y)
     }
 
     public override func otherMouseDragged(with event: NSEvent) {
         let (x, y) = remotePoint(from: event)
-        renderCompositedFrame() // 光标跟手，不必等新帧
+        scheduleCursorRedraw() // 光标跟手，不必等新帧
         onMouseMove?(x, y)
     }
 

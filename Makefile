@@ -23,7 +23,7 @@ BENCH_WIDTH   ?= 1920
 BENCH_HEIGHT  ?= 1080
 BENCH_FPS     ?= 30
 
-.PHONY: all build run app spike check bench cursor-check clean
+.PHONY: all build run app spike check bench cursor-check hover-check clean
 
 all: build
 
@@ -62,6 +62,11 @@ bench:
 	@swift build -c $(CONFIG) >/dev/null
 	@$$(swift build -c $(CONFIG) --show-bin-path)/rdpbridge-cli render-bench \
 		$(BENCH_SECONDS) $(BENCH_WIDTH) $(BENCH_HEIGHT) $(BENCH_FPS)
+
+## 鼠标移动跟踪自检（远端 hover 不跟手的回归防护）
+hover-check:
+	@swift build -c $(CONFIG) >/dev/null
+	@$$(swift build -c $(CONFIG) --show-bin-path)/rdpbridge-cli hover-check
 
 ## 光标合成自检（像素级验证 + 导出 PNG 供目视）
 cursor-check:

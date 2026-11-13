@@ -244,6 +244,31 @@ libfreerdp3 / libwinpr3 (Homebrew)
 swift run rdpbridge-cli cursor-check /tmp          # 像素级验证 over 合成 + 导出 PNG
 ```
 
+## hover：不需要先点一下
+
+远端的 hover（链接高亮、悬停菜单）依赖持续的鼠标移动事件，而 macOS 默认**不会**把
+`NSMouseMoved` 送到 NSView：那条通路要求 `window.acceptsMouseMovedEvents` 为真**且**
+视图是 first responder。SwiftUI 的宿主窗口不会打开该开关，抽屉被操作时渲染视图还会
+主动让出焦点（见 `RDPRenderView.suppressFocusGrab`）—— 表现就是
+「必须先点一下，远端的 hover 才出来」（点击事件自带坐标，服务端这才知道光标在哪）。
+
+`RDPRenderNSView.updateTrackingAreas` 注册一个覆盖全视图的
+`NSTrackingArea(.mouseMoved | .activeAlways | .inVisibleRect)`：
+跟踪区域按视图生效，上述两个前提都不依赖（`.activeAlways` 连窗口非 key 时也跟踪）。
+
+移动事件一旦真的送达就是高频事件，所以本地光标重绘按 runloop 合并
+（`scheduleCursorRedraw` —— `composited()` 每次要复制整帧，1080p 约 8 MB）；
+发往远端的输入事件仍逐条即时下发，不影响手感。
+
+自检：
+
+```bash
+make hover-check        # 跟踪区域注册（含 resize 后重建）+ 坐标换算与回调链路
+```
+
+> 局限：事件能否真被 AppKit 投递，命令行工具里没有窗口事件循环、模拟不了；
+> 需在会话里人工确认——把光标停在远端页面的链接上、不点鼠标，看是否高亮。
+
 ## 滚轮事件编码
 
 RDP 的滚轮事件（MS-RDPBCGR 2.2.8.1.1.3.1）有个反直觉之处：

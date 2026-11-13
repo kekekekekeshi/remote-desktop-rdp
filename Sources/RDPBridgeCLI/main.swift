@@ -404,6 +404,81 @@ func runRenderOrientationCheck(width: Int, height: Int) {
     exit(1)
 }
 
+/// 鼠标移动跟踪自检（远端 hover 不跟手的回归防护）。
+///
+/// 复现并防回归：`mouseMoved` 默认不会送到 NSView —— 那条通路要求
+/// `window.acceptsMouseMovedEvents` 为真**且**视图是 first responder。SwiftUI 的宿主窗口
+/// 不会打开该开关，抽屉被操作时渲染视图还会主动让出焦点，结果就是
+/// 「必须先点一下，远端才知道光标在哪」，hover 效果不出来。
+/// 渲染视图自带一个覆盖全视图的 tracking area（.mouseMoved + .activeAlways）来绕开这两个前提。
+///
+/// 这里能自动验证的是两件事（事件投递本身要靠真实会话，见末尾说明）：
+/// 1. 跟踪区域确实注册了，且 resize 后重建而不残留旧的；
+/// 2. `mouseMoved` 被调用时，坐标换算与回调链路正确（视图坐标 → 远端像素）。
+@MainActor
+func runHoverTrackingCheck() {
+    print("== 鼠标移动跟踪自检 ==")
+
+    let view = RDPRenderNSView(backend: .coreGraphics, onRenderCost: nil)
+    var received: [(x: UInt16, y: UInt16)] = []
+    view.onMouseMove = { x, y in received.append((x, y)) }
+
+    let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 300),
+                          styleMask: [.titled], backing: .buffered, defer: false)
+    window.acceptsMouseMovedEvents = false      // 与 SwiftUI 宿主窗口一致：不开这个开关
+    if let content = window.contentView {
+        view.frame = content.bounds
+        content.addSubview(view)
+    }
+    window.makeFirstResponder(view)
+    window.update()
+    view.updateTrackingAreas()
+
+    func movedAreas(in target: NSView) -> [NSTrackingArea] {
+        target.trackingAreas.filter { $0.options.contains(.mouseMoved) }
+    }
+
+    // 1) 跟踪区域：必须是 .mouseMoved + .activeAlways（后者保证非 key 窗口也跟踪）
+    let areas = movedAreas(in: view)
+    let activeAlways = areas.allSatisfy { $0.options.contains(.activeAlways) }
+    let registered = !areas.isEmpty && activeAlways
+
+    // 视图尺寸变了以后必须重建，不能留着覆盖旧 bounds 的跟踪区域
+    view.frame = NSRect(x: 0, y: 0, width: 800, height: 600)
+    view.updateTrackingAreas()
+    let areasAfterResize = movedAreas(in: view)
+    let rebuilt = areasAfterResize.count == areas.count && !areasAfterResize.isEmpty
+
+    // 2) 坐标换算与回调：视图是 flipped 的（与 RDP 的左上原点一致，不需要再翻转）。
+    //    `locationInWindow` 是窗口基坐标（原点左下），视图 bounds 800×600 且位于 (0,0)，
+    //    远端 1024×768（未收到帧时的默认尺寸）。
+    //    本地 (100,100) → 视图内 y = 600−100 = 500 → 远端 (100×1024/800, 500×768/600)
+    //    = (128, 640)。若 y 轴少翻或多翻一次，得到的是 128 / 512，断言就会失败。
+    if let event = NSEvent.mouseEvent(
+        with: .mouseMoved, location: NSPoint(x: 100, y: 100),
+        modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+        windowNumber: window.windowNumber, context: nil, eventNumber: 0,
+        clickCount: 0, pressure: 0) {
+        view.mouseMoved(with: event)
+    }
+    let got = received.first
+    let wiringOK = got != nil && got?.x == 128 && got?.y == 640
+
+    print("tracking area(.mouseMoved + .activeAlways): \(registered ? "✅" : "❌")"
+          + " 数量=\(areas.count)")
+    print("resize 后重建: \(rebuilt ? "✅" : "❌") 数量=\(areasAfterResize.count)")
+    print("mouseMoved 坐标换算与回调: \(wiringOK ? "✅" : "❌")"
+          + " 收到=\(got.map { "(\($0.x),\($0.y))" } ?? "无") 期望=(128,640)")
+
+    let ok = registered && rebuilt && wiringOK
+    print(ok ? """
+        == 自检通过 ==
+        注：真实指针移动是否被 AppKit 投递给视图，命令行工具里没有窗口事件循环，
+        需在会话里人工确认（把光标停在远端页面的链接/按钮上，不点鼠标看是否高亮）。
+        """ : "== 自检失败：hover 不会跟手 ==")
+    exit(ok ? 0 : 1)
+}
+
 /// 渲染后端切换自检。
 ///
 /// 复现并防回归：切换后端后必须**用当前帧立刻重绘**。
@@ -959,6 +1034,10 @@ if arguments.count > 1 && arguments[1] == "render-switch-check" {
             width: arguments.count > 2 ? (Int(arguments[2]) ?? 1024) : 1024,
             height: arguments.count > 3 ? (Int(arguments[3]) ?? 768) : 768)
     }
+}
+
+if arguments.count > 1 && arguments[1] == "hover-check" {
+    MainActor.assumeIsolated { runHoverTrackingCheck() }
 }
 
 if arguments.count > 1 && arguments[1] == "retry-check" {
