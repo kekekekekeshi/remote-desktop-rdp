@@ -128,16 +128,27 @@ Gatekeeper 拦下（提示"无法验证开发者"）。两种处理方式：
 这个值只是**首次连接请求的尺寸**；勾选了「窗口变化时请求远端调整分辨率」之后，
 连上后远端会跟随窗口大小自行调整。
 
-「键盘」区选 **Command 键**在远端扮演什么角色，默认 **Ctrl**：
+「键盘」区选 **修饰键映射**，默认 **Ctrl**：
 
 - **Ctrl（默认）**：`Cmd+C` / `Cmd+V` / `Cmd+A` 等按 Linux 习惯生效，符合 Mac 直觉。
   代价：远端的 Win 键（Super）不再可达。
 - **Win 键**：保留 Super 以使用系统级快捷键。
   代价：复制粘贴要在远端按 `Ctrl+C` / `Ctrl+V`，按 `Cmd+C` / `Cmd+V` 无效。
+- **互换（Cmd→Ctrl，Ctrl→Win）**：Mac 的 Command 当远端 Ctrl，Mac 的 Control 当远端
+  Win（Super）—— 两套都可达：`Cmd+C` 是复制，`Control+S` 之类是 GNOME 系统级快捷键。
+  代价：Mac 键盘上的 Control 不再是 Ctrl。这是习惯完全按 Linux 排的用法
+  （相当于在远端把 Ctrl 与 Super 两个键位对调）。
 
 > 这一项默认改成 Ctrl 是有原因的：Mac 用户的肌肉记忆是 `Cmd+C` / `Cmd+V`，
 > 若把 Cmd 当 Win 键，远端收到的是 `Win+C` / `Win+V`，什么都不会发生 ——
 > 表现出来就是「剪贴板不能用」。
+
+实现上走**扫描码**而非字符：Command 当 Ctrl 时用右 Ctrl 扫描码（`0xE0 1D`），
+避免与 Mac 左 Ctrl（`0x1D`）在「同时按住」时相互顶掉；互换模式下 Control 走
+左/右 Win（`0xE0 5B` / `0xE0 5C`），彼此不冲突。
+
+> macOS 自己的菜单快捷键（如 `⌃⌘F` 全屏、`⌘N` 新建连接）是在**物理键**上拦截的，
+> 不受该设置影响。互换模式下想按 `⌃⌘…` 组合时，先想到它可能被 macOS 截走。
 
 首次连接会弹出服务端证书指纹确认（TOFU）。gnome-remote-desktop 使用自签名证书，
 无法用公共 CA 验证，需要你核对指纹：
@@ -313,6 +324,51 @@ swift run rdpbridge-cli store-check | grep 滚轮    # 期望「滚轮标志编�
 > 另一处同类问题：`scrollWheel` 只读 `scrollingDeltaY`，
 > 于是两指左右滑动在远端完全没有反应 —— 见上表的 `PTR_FLAGS_HWHEEL`。
 
+## 键盘：修饰键映射与组合键
+
+按键走**扫描码**而不是字符（`KeyMapping`）：Ctrl/Alt 组合、功能键、方向键都必须走这条路，
+只有映射表里没有的键（含 IME 输入）才退化成 `sendUnicode`。
+
+修饰键角色由每份配置的 `cmdKeyBehavior` 决定，与远端是 Linux 还是 Windows 无关：
+
+| 模式 | 物理 Cmd | 物理 Control |
+| --- | --- | --- |
+| `control`（默认） | 远端 Ctrl | 远端 Ctrl |
+| `windows` | 远端 Win（Super） | 远端 Ctrl |
+| `swapped`（互换） | 远端 Ctrl | 远端 Win（Super） |
+
+两个实现细节：
+
+1. **Cmd 当 Ctrl 时用右侧 Ctrl 的扫描码**（`0xE0 1D`）。Mac 的左 Ctrl 已占用左侧 `0x1D`，
+   Cmd 走右侧可以避免「同时按住 Ctrl 和 Cmd」时两者互相顶掉。互换模式同理：
+   Cmd→`0xE0 1D`、Control→`0xE0 5B` / `0xE0 5C`，三套码互不冲突。
+2. **按下/抬起必须成对**。修饰键的抬起只能从 `flagsChanged` 得知，而 macOS 在应用失焦
+   （⌘Tab、点别的窗口、抽屉抢焦点）时**不会补发**该事件，远端就会永久卡住 Ctrl ——
+   表现是此后每个按键都变成 `Ctrl+某键`，看起来像键盘整体失灵、只有重连能恢复。
+   渲染视图因此记录已下发的修饰键（`sentModifiers`），在失焦、离开窗口、以及**每个按键前**
+   对账补发抬起（`reconcileModifiers`），下一次按键即可自愈。
+
+### 被 macOS 编辑菜单吃掉的组合键
+
+SwiftUI 应用自带「编辑」菜单，其中 Cut / Copy / Paste 持有 `⌘X` / `⌘C` / `⌘V` 的快捷键，
+事件在到达视图之前就被菜单当 key equivalent 处理掉 —— 远端收到的是「什么都没发生」。
+而 `⌘A`（Select All）恰好没被占用，能正常落到 `keyDown`，于是现象很反直觉：
+**能全选，不能复制粘贴**。
+
+修法是在 `.keyDown` 本地事件监听里先把这几组拦下，按映射转发给远端。这里有个必须记住的坑：
+
+> **拦下来之后要自己补发「抬起」。** 本地监听返回 nil 吞掉 keyDown 后，
+> AppKit **不会**再投递这个键的 keyUp（实测确认）。只发按下不发抬起，远端会把这个键
+> 永久当成按住状态，和卡住 Ctrl 的症状一样。所以拦截路径按「点按」语义直接发 down+up；
+> 代价是长按 `⌘C` / `⌘V` 不会产生连续重复（每次重复的 keyDown 各触发一次，表现为多次触发）。
+
+自检：
+
+```bash
+make key-check        # ⌘C 拦截后必须同时产生 0x002E↓ 与 0x002E↑，普通按键不受影响
+swift run rdpbridge-cli store-check | grep 键映射   # 三种模式的扫描码
+```
+
 ## 剪贴板（文本，双向）
 
 文本剪贴板走 CLIPRDR 静态通道，两个方向都是「先宣告格式，按需再取内容」：
@@ -484,7 +540,8 @@ make bench BENCH_SECONDS=8 BENCH_WIDTH=2560 BENCH_HEIGHT=1440
 
 **先确认按键映射。** 默认配置是「Cmd 当 Ctrl」，所以 `Cmd+C` / `Cmd+V` 直接生效。
 若这条配置被改成了 **Win 键**，远端收到的是 `Win+C` / `Win+V`，什么都不会发生 ——
-此时要么在远端改用 `Ctrl+C` / `Ctrl+V`，要么把「键盘 → Command 键」改回 Ctrl。
+此时要么在远端改用 `Ctrl+C` / `Ctrl+V`，要么把「键盘 → 修饰键映射」改回 Ctrl
+（想同时保留 Super，选「互换」）。
 
 再检查：
 
@@ -502,6 +559,28 @@ make bench BENCH_SECONDS=8 BENCH_WIDTH=2560 BENCH_HEIGHT=1440
 make clipboard-check RDP_HOST=<ip> RDP_USER=<user> RDP_PASSWORD=<pw>
 # 对照「剪贴板（文本，双向）」里的日志表，能判断是「没宣告」还是「服务端没来取」
 ```
+
+> **典型症状：能全选、不能复制粘贴**（`⌘A` 生效、`⌘C` / `⌘V` 无反应）。
+> 说明 Ctrl 修饰键没问题，是 `⌘C` / `⌘V` / `⌘X` 被 macOS 的「编辑」菜单截走了 ——
+> 见「键盘：修饰键映射与组合键」一节的说明与修法，回归防护是 `make key-check`。
+>
+> 若仍不生效，打开键位日志可看到每个按键的 keyCode → 扫描码，判断是事件没到、
+> 还是映射/下发有问题。**双击启动的 GUI 不继承终端环境变量**，两种可行方式：
+>
+> ```bash
+> # 方式一：前台运行二进制，日志直接打在终端（NSLog 走 stderr）
+> RDP_KEYLOG=1 ./build/RDPConnector.app/Contents/MacOS/RDPConnector
+>
+> # 方式二：写文件，然后正常双击/用 launchctl 注入环境变量
+> launchctl setenv RDP_KEYLOG /tmp/rdpkey.log
+> open ./build/RDPConnector.app
+> tail -f /tmp/rdpkey.log
+> launchctl unsetenv RDP_KEYLOG      # 用完记得清掉
+> ```
+>
+> 判读：失效后按普通字母 —— 没有任何日志说明事件没到视图（焦点问题）；
+> 有 `keyDown ... scancode=0x…` 说明事件到了，问题在下发或远端；
+> 出现 `补发修饰键抬起` 说明远端曾卡住修饰键、已被自愈清掉。
 
 ### 提示「服务端结束了会话」(`ERRINFO_LOGOFF_BY_USER`)
 
@@ -551,6 +630,7 @@ swift run rdpbridge-cli store-check
 swift run rdpbridge-cli render-bench [seconds] [width] [height] [fps]
 swift run rdpbridge-cli render-switch-check [width] [height]       # 后端切换不黑屏
 swift run rdpbridge-cli render-orientation-check [width] [height]  # 画面朝向正确
+swift run rdpbridge-cli key-check                                  # ⌘C/⌘V 拦截后按下+抬起成对
 swift run rdpbridge-cli retry-check <host> <user> <password>   # 重连不报「已有会话」
 swift run rdpbridge-cli kit-check <host> <user> <password> [seconds] [width] [height]
 swift run rdpbridge-cli <host> <user> <password> [port] [seconds] [width] [height]

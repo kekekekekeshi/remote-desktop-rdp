@@ -26,7 +26,7 @@ public struct RDPProfile: Codable, Identifiable, Hashable {
     public var clipboard: Bool
     /// TOFU：已信任的服务端证书指纹（sha256）。`nil` 表示尚未信任。
     public var trustedFingerprint: String?
-    /// Command 键在远端扮演 Ctrl 还是 Win 键，见 `CmdKeyBehavior`
+    /// 修饰键映射（Cmd 扮演 Ctrl / Win，或互换），见 `CmdKeyBehavior`
     public var cmdKeyBehavior: CmdKeyBehavior
 
     public init(

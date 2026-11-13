@@ -404,6 +404,96 @@ func runRenderOrientationCheck(width: Int, height: Int) {
     exit(1)
 }
 
+/// 键位自检：被 macOS 编辑菜单占用的 `⌘C` / `⌘V` / `⌘X` 被拦下后，
+/// 远端必须收到**成对的**按下与抬起。
+///
+/// 背景（实测踩过）：`NSEvent.addLocalMonitorForEvents` 返回 nil 吞掉 keyDown 之后，
+/// AppKit **不会**再投递这个键的 keyUp。只发按下不发抬起，远端会把这个键永久当成
+/// 按住状态 —— 表现是此后键盘整体失灵、点画面无效、只能重连。
+///
+/// 这里用合成事件走完整链路（postEvent → nextEvent 触发本地监听 → sendEvent），
+/// 断言 onKey 收到 `C 按下` 与 `C 抬起` 各一次。
+@MainActor
+func runKeyShortcutCheck() {
+    print("== 键位自检（编辑快捷键拦截）==")
+
+    let app = NSApplication.shared
+    app.setActivationPolicy(.accessory)
+
+    let view = RDPRenderNSView(backend: .coreGraphics, onRenderCost: nil)
+    view.cmdKeyBehavior = .control
+    var events: [(scancode: UInt16, down: Bool)] = []
+    view.onKey = { scancode, down in events.append((scancode, down)) }
+
+    let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 300),
+                          styleMask: [.titled], backing: .buffered, defer: false)
+    if let content = window.contentView {
+        view.frame = content.bounds
+        content.addSubview(view)
+    }
+    window.makeKeyAndOrderFront(nil)
+    app.activate(ignoringOtherApps: true)
+    window.makeFirstResponder(view)
+    window.update()
+
+    func pump(_ seconds: TimeInterval = 0.08) {
+        let deadline = Date(timeIntervalSinceNow: seconds)
+        while Date() < deadline {
+            if let event = app.nextEvent(matching: .any,
+                                         until: Date(timeIntervalSinceNow: 0.01),
+                                         inMode: .default, dequeue: true) {
+                app.sendEvent(event)
+            }
+        }
+    }
+
+    // 拦截路径要求窗口是 key window；命令行里激活可能稍晚，轮询等一下
+    for _ in 0..<50 where !window.isKeyWindow {
+        window.makeKey()
+        pump(0.02)
+    }
+
+    func post(_ type: NSEvent.EventType, keyCode: UInt16, chars: String,
+              flags: NSEvent.ModifierFlags) {
+        guard let event = NSEvent.keyEvent(
+            with: type, location: .zero, modifierFlags: flags,
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: window.windowNumber, context: nil,
+            characters: chars, charactersIgnoringModifiers: chars,
+            isARepeat: false, keyCode: keyCode
+        ) else { return }
+        app.postEvent(event, atStart: false)
+        pump()
+    }
+
+    let keyWindow = window.isKeyWindow
+    let isFirstResponder = window.firstResponder === view
+
+    // ⌘C：走本地监听拦截路径，必须补齐抬起
+    post(.keyDown, keyCode: 8, chars: "c", flags: .command)
+    post(.keyUp, keyCode: 8, chars: "c", flags: .command)
+    let cmdCEvents = events
+    let cmdCDown = cmdCEvents.contains { $0.scancode == 0x002E && $0.down }
+    let cmdCUp = cmdCEvents.contains { $0.scancode == 0x002E && !$0.down }
+
+    // 普通按键不受影响（不经过拦截路径）
+    events.removeAll()
+    post(.keyDown, keyCode: 2, chars: "d", flags: [])
+    post(.keyUp, keyCode: 2, chars: "d", flags: [])
+    let plainDown = events.contains { $0.scancode == 0x0020 && $0.down }
+    let plainUp = events.contains { $0.scancode == 0x0020 && !$0.down }
+
+    print("窗口可接收键盘（keyWindow=\(keyWindow) firstResponder=\(isFirstResponder)）: "
+          + "\(keyWindow && isFirstResponder ? "✅" : "❌")")
+    print("⌘C 拦截后下发按下 + 抬起: \(cmdCDown && cmdCUp ? "✅" : "❌")"
+          + " 收到=\(cmdCEvents.map { "0x" + String(format: "%04X", $0.scancode) + ($0.down ? "↓" : "↑") })")
+    print("普通按键不受影响: \(plainDown && plainUp ? "✅" : "❌")")
+
+    let ok = keyWindow && isFirstResponder && cmdCDown && cmdCUp && plainDown && plainUp
+    print(ok ? "== 自检通过 ==" : "== 自检失败：编辑快捷键会让远端卡键 ==")
+    exit(ok ? 0 : 1)
+}
+
 /// 鼠标移动跟踪自检（远端 hover 不跟手的回归防护）。
 ///
 /// 复现并防回归：`mouseMoved` 默认不会送到 NSView —— 那条通路要求
@@ -847,17 +937,29 @@ func runStoreCheck() {
           + " id唯一=\(uniqueIDs) 升序=\(ascending) 含1920×1080=\(hasDefault)")
 
     // Cmd 键映射：默认当 Ctrl（右 Ctrl 0x011D），配成 Win 时走左 Win 0x015B；
+    // 「互换」模式则把 Mac 的 Control 送去当 Win（0x015B），Cmd 仍当 Ctrl；
     // 普通字母键不受该设置影响
     let cmdAsCtrl = KeyMapping.scancode(forMacVirtualKeyCode: 55, cmdBehavior: .control)
     let cmdAsWin = KeyMapping.scancode(forMacVirtualKeyCode: 55, cmdBehavior: .windows)
+    let swappedCmd = KeyMapping.scancode(forMacVirtualKeyCode: 55, cmdBehavior: .swapped)
+    let swappedLctrl = KeyMapping.scancode(forMacVirtualKeyCode: 59, cmdBehavior: .swapped)
+    let swappedRctrl = KeyMapping.scancode(forMacVirtualKeyCode: 62, cmdBehavior: .swapped)
+    let plainLctrl = KeyMapping.scancode(forMacVirtualKeyCode: 59, cmdBehavior: .control)
     let letterC = KeyMapping.scancode(forMacVirtualKeyCode: 8, cmdBehavior: .control)
     let mappingOK = cmdAsCtrl == (0x1D | KeyMapping.extendedFlag)
         && cmdAsWin == (0x5B | KeyMapping.extendedFlag)
+        && swappedCmd == (0x1D | KeyMapping.extendedFlag)
+        && swappedLctrl == (0x5B | KeyMapping.extendedFlag)
+        && swappedRctrl == (0x5C | KeyMapping.extendedFlag)
+        && plainLctrl == 0x1D
         && letterC == 0x2E
+    func hex(_ v: UInt16?) -> String { "0x" + (v.map { String($0, radix: 16) } ?? "nil") }
     print("Cmd 键映射: \(mappingOK ? "✅" : "❌")"
-          + " Cmd→Ctrl=0x\(cmdAsCtrl.map { String($0, radix: 16) } ?? "nil")"
-          + " Cmd→Win=0x\(cmdAsWin.map { String($0, radix: 16) } ?? "nil")"
-          + " C→0x\(letterC.map { String($0, radix: 16) } ?? "nil")")
+          + " Cmd→Ctrl=\(hex(cmdAsCtrl))"
+          + " Cmd→Win=\(hex(cmdAsWin))"
+          + " 互换 Cmd→Ctrl=\(hex(swappedCmd)) Ctrl→Win=\(hex(swappedLctrl))/\(hex(swappedRctrl))"
+          + " 普通 Ctrl=\(hex(plainLctrl))"
+          + " C→\(hex(letterC))")
 
     // 滚轮标志编码：竖向 PTR_FLAGS_WHEEL / 横向 PTR_FLAGS_HWHEEL（互斥），
     // 旋转量放 flags 低 9 位（一格 120，负向按 9 位补码）——与 README 的表一致
@@ -1136,6 +1238,10 @@ if arguments.count > 1 && arguments[1] == "render-switch-check" {
 
 if arguments.count > 1 && arguments[1] == "hover-check" {
     MainActor.assumeIsolated { runHoverTrackingCheck() }
+}
+
+if arguments.count > 1 && arguments[1] == "key-check" {
+    MainActor.assumeIsolated { runKeyShortcutCheck() }
 }
 
 if arguments.count > 1 && arguments[1] == "retry-check" {

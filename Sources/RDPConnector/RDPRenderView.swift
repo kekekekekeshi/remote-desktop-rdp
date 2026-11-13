@@ -53,7 +53,7 @@ struct RDPRenderView: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: RDPRenderNSView, context: Context) {
-        // Command 键的角色（Ctrl / Win）。编辑器里改完重连即生效
+        // Command 键的角色（Ctrl / Win / 互换）。编辑器里改完重连即生效
         nsView.cmdKeyBehavior = controller.profile.cmdKeyBehavior
 
         // 后端切换。这里无条件调用，由 setBackend 内部用「请求的后端」判断是否真的变了，

@@ -1,12 +1,14 @@
 import AppKit
 import Foundation
 
-/// macOS 的 Command 键在远端扮演什么角色。
+/// 修饰键在远端扮演什么角色（Command 键，以及互换模式下的 Control 键）。
 ///
 /// 这是个**习惯问题**，没有唯一正确答案：
 ///   - Mac 用户的肌肉记忆是 Cmd+C / Cmd+V，若把 Cmd 当 Win 键，远端（GNOME）
 ///     收到的是 Win+C / Win+V，什么都不会发生 —— 表现为「剪贴板不能用」
 ///   - 但 GNOME 的系统级快捷键（Super）又确实需要 Win 键
+///   - 想在远端**同时**用 `Cmd+C`（复制）和 Super 快捷键（ Activities / Super+S ），
+///     只能把 Mac 的 Control 腾出来当 Win 键 —— 即 `.swapped`
 ///
 /// 因此做成可配置，默认取 `.control`（与 Parallels / VMware 的默认一致）。
 public enum CmdKeyBehavior: String, Codable, CaseIterable, Identifiable {
@@ -14,6 +16,8 @@ public enum CmdKeyBehavior: String, Codable, CaseIterable, Identifiable {
     case control
     /// 当作 Win 键（GNOME 的 Super）
     case windows
+    /// 互换：Cmd → 远端 Ctrl，Mac 的 Control → 远端 Win（Super）
+    case swapped
 
     public var id: String { rawValue }
 
@@ -21,6 +25,7 @@ public enum CmdKeyBehavior: String, Codable, CaseIterable, Identifiable {
         switch self {
         case .control: return "Ctrl"
         case .windows: return "Win 键"
+        case .swapped: return "互换（Cmd→Ctrl，Ctrl→Win）"
         }
     }
 
@@ -32,6 +37,10 @@ public enum CmdKeyBehavior: String, Codable, CaseIterable, Identifiable {
         case .windows:
             return "保留 Win 键（Super）以使用系统级快捷键。"
                 + "代价：复制粘贴要在远端按 Ctrl+C / Ctrl+V，按 Cmd+C / Cmd+V 无效。"
+        case .swapped:
+            return "两套都可达：按 Cmd+C / Cmd+V 得到远端的 Ctrl+C / Ctrl+V，"
+                + "按 Mac 的 Control 得到远端的 Win（Super），可用 Activities、Super+S 等系统级快捷键。"
+                + "代价：Mac 键盘上的 Control 不再是 Ctrl。"
         }
     }
 }
@@ -139,32 +148,41 @@ public enum KeyMapping {
         124: 0x4D, // →
         125: 0x50, // ↓
         126: 0x48, // ↑
-        // 注意：Command（55 / 54）不在这里 —— 它按用户的 CmdKeyBehavior 决定映射成
-        // Ctrl 还是 Win 键，见 commandScancode
+        // 注意：Command（55 / 54）与「互换」模式下的 Control（59 / 62）不在这里 ——
+        // 它们按用户的 CmdKeyBehavior 重新扮演角色，见 remappedModifier
     ]
 
-    /// Command 键的目标扫描码。
+    /// 按下表重新扮演角色的修饰键。其余情况返回 nil，走基本/扩展表。
     ///
-    /// 当作 Ctrl 时用**右侧** Ctrl 的扫描码：Mac 上的左 Ctrl（59）已占用左侧 0x1D，
+    /// | 物理键 | `.control` | `.windows` | `.swapped` |
+    /// | --- | --- | --- | --- |
+    /// | Command（55 / 54） | 右 Ctrl | 左/右 Win | 右 Ctrl |
+    /// | Control（59 / 62） | 左/右 Ctrl | 左/右 Ctrl | 左/右 Win |
+    ///
+    /// Command 当作 Ctrl 时用**右侧** Ctrl 的扫描码：Mac 上的左 Ctrl（59）已占用左侧 0x1D，
     /// 让 Cmd 走右侧可以避免「同时按住 Ctrl 和 Cmd」时两者互相顶掉。
-    private static func commandScancode(forMacVirtualKeyCode keyCode: UInt16,
+    /// 互换模式下两套扫描码仍然互不冲突（Cmd→0x1D+扩展，Ctrl→0x5B/0x5C+扩展）。
+    private static func remappedModifier(keyCode: UInt16,
                                         behavior: CmdKeyBehavior) -> UInt16? {
         switch (keyCode, behavior) {
-        case (55, .control): return 0x1D | extendedFlag  // 左 Cmd → 右 Ctrl
-        case (54, .control): return 0x1D | extendedFlag  // 右 Cmd → 右 Ctrl
+        case (55, .control), (54, .control), (55, .swapped), (54, .swapped):
+            return 0x1D | extendedFlag                // Cmd → 右 Ctrl
         case (55, .windows): return 0x5B | extendedFlag  // 左 Cmd → 左 Win
         case (54, .windows): return 0x5C | extendedFlag  // 右 Cmd → 右 Win
+        case (59, .swapped): return 0x5B | extendedFlag  // 左 Control → 左 Win（Super）
+        case (62, .swapped): return 0x5C | extendedFlag  // 右 Control → 右 Win（Super）
         default: return nil
         }
     }
 
     /// 把 macOS 虚拟键码转换为桥接层可用的扫描码。未知键返回 nil。
     ///
-    /// - Parameter cmdBehavior: Command 键扮演 Ctrl 还是 Win 键，见 `CmdKeyBehavior`
+    /// - Parameter cmdBehavior: Command 键（以及互换模式下的 Control）扮演什么角色，
+    ///   见 `CmdKeyBehavior`
     public static func scancode(forMacVirtualKeyCode keyCode: UInt16,
                                cmdBehavior: CmdKeyBehavior = .control) -> UInt16? {
-        if let command = commandScancode(forMacVirtualKeyCode: keyCode, behavior: cmdBehavior) {
-            return command
+        if let remapped = remappedModifier(keyCode: keyCode, behavior: cmdBehavior) {
+            return remapped
         }
         if let code = basic[keyCode] { return code }
         if let code = extended[keyCode] { return code | extendedFlag }

@@ -20,7 +20,7 @@ public final class RDPRenderNSView: NSView {
     public var onKey: ((UInt16, Bool) -> Void)?
     public var onUnicode: ((UInt16, Bool) -> Void)?
 
-    /// Command 键在远端扮演 Ctrl 还是 Win 键，见 `CmdKeyBehavior`
+    /// 修饰键映射（Cmd 当 Ctrl / Win，或互换）。见 `CmdKeyBehavior`
     public var cmdKeyBehavior: CmdKeyBehavior = .control
 
     /// 当前实际生效的后端（Metal 不可用时会回退，因此可能与请求的不同）
@@ -45,6 +45,26 @@ public final class RDPRenderNSView: NSView {
     private var renderCostHandler: ((Double) -> Void)?
     private var remoteSize = CGSize(width: 1024, height: 768)
     private let cursorCompositor = CursorCompositor()
+
+    /// macOS「编辑」菜单占用的快捷键所对应的键（见 `handleEditingShortcut`）
+    private static let editingShortcutKeys: Set<String> = ["a", "c", "v", "x", "z", "y"]
+
+    /// 本地事件监听句柄（`.keyDown` 在分发前拦下被菜单吃掉的组合）
+    private var shortcutMonitor: Any?
+
+    /// 窗口失焦通知（用于补发修饰键抬起）
+    private var resignKeyObserver: NSObjectProtocol?
+
+    /// 键位日志开关：环境变量 `RDP_KEYLOG` 存在即开启
+    private static let keyLogEnabled = ProcessInfo.processInfo.environment["RDP_KEYLOG"] != nil
+
+    /// `RDP_KEYLOG` 的值不是 `1` 时当作文件路径，日志直接追加写入（GUI 启动也方便看）
+    private static let keyLogFile: String? = {
+        guard let value = ProcessInfo.processInfo.environment["RDP_KEYLOG"],
+              !value.isEmpty, value != "1"
+        else { return nil }
+        return value
+    }()
 
     public override var isFlipped: Bool { true }
     public override var acceptsFirstResponder: Bool { true }
@@ -226,6 +246,10 @@ public final class RDPRenderNSView: NSView {
     }
 
     public override func mouseDown(with event: NSEvent) {
+        // 点画面即取回键盘焦点：焦点被抽屉控件等拿走时键盘会整块失效
+        if window?.firstResponder !== self {
+            window?.makeFirstResponder(self)
+        }
         let (x, y) = remotePoint(from: event)
         onMouseButton?(RDPMouseButton.left, true, x, y)
     }
@@ -322,6 +346,36 @@ public final class RDPRenderNSView: NSView {
 
     // MARK: - 键盘
 
+    /// 本地修饰键。用它记录「已向远端下发按下」的状态，保证 down/up 成对。
+    private enum LocalModifier {
+        case command, shift, control, option
+
+        init?(keyCode: UInt16) {
+            switch keyCode {
+            case 55, 54: self = .command
+            case 56, 60: self = .shift
+            case 59, 62: self = .control
+            case 58, 61: self = .option
+            default: return nil
+            }
+        }
+
+        func isDown(in flags: NSEvent.ModifierFlags) -> Bool {
+            switch self {
+            case .command: return flags.contains(.command)
+            case .shift: return flags.contains(.shift)
+            case .control: return flags.contains(.control)
+            case .option: return flags.contains(.option)
+            }
+        }
+    }
+
+    /// 已下发「按下」但尚未抬起的修饰键 → 实际下发的扫描码。
+    ///
+    /// 记录扫描码而不是重算：Cmd 的映射可能随设置变化，抬起时必须用**当初按下**的那个码，
+    /// 否则远端会卡着一个永不释放的修饰键。
+    private var sentModifiers: [LocalModifier: UInt16] = [:]
+
     public override func keyDown(with event: NSEvent) {
         forwardKey(event, down: true)
     }
@@ -332,15 +386,160 @@ public final class RDPRenderNSView: NSView {
 
     public override func flagsChanged(with event: NSEvent) {
         // 修饰键的按下/抬起只能从 flagsChanged 得知
-        guard KeyMapping.isModifier(event.keyCode),
+        guard let modifier = LocalModifier(keyCode: event.keyCode),
               let scancode = KeyMapping.scancode(forMacVirtualKeyCode: event.keyCode,
                                                  cmdBehavior: cmdKeyBehavior)
         else { return }
 
-        onKey?(scancode, modifierIsDown(event))
+        logKey(event, note: "flagsChanged")
+
+        if modifier.isDown(in: event.modifierFlags) {
+            // 去重：重复的 down 会让远端把它当「按住不放」
+            guard sentModifiers[modifier] == nil else { return }
+            sentModifiers[modifier] = scancode
+            onKey?(scancode, true)
+        } else {
+            // 用实际下发过的扫描码回抬
+            guard let sent = sentModifiers.removeValue(forKey: modifier) else { return }
+            onKey?(sent, false)
+        }
+    }
+
+    /// 自愈：本地物理键已经抬起、但我们仍认为远端按着时，补发抬起。
+    ///
+    /// macOS 在应用失焦（⌘Tab、点别的窗口、抽屉抢焦点）时**不会**补发 flagsChanged，
+    /// 于是远端会永久卡住 Ctrl —— 表现是此后每个按键都变成 `Ctrl+某键`，
+    /// 看起来就是「键盘完全失灵」，而且点画面、点按钮都救不回来，只有重连才恢复。
+    private func reconcileModifiers(with flags: NSEvent.ModifierFlags) {
+        guard !sentModifiers.isEmpty else { return }
+        for (modifier, scancode) in sentModifiers where !modifier.isDown(in: flags) {
+            logRelease(modifier, scancode)
+            onKey?(scancode, false)
+            sentModifiers[modifier] = nil
+        }
+    }
+
+    /// 释放所有已下发的修饰键（失焦 / 离开窗口时调用）
+    private func releaseAllModifiers() {
+        guard !sentModifiers.isEmpty else { return }
+        for (modifier, scancode) in sentModifiers {
+            logRelease(modifier, scancode)
+            onKey?(scancode, false)
+        }
+        sentModifiers.removeAll()
+    }
+
+    private func logRelease(_ modifier: LocalModifier, _ scancode: UInt16) {
+        guard Self.keyLogEnabled else { return }
+        appendKeyLog(String(format: "补发修饰键抬起 scancode=0x%04X (%@)",
+                            scancode, String(describing: modifier)))
+    }
+
+    /// 统一的日志出口：系统日志 + 可选文件
+    private func appendKeyLog(_ line: String) {
+        NSLog("[RDPKey] %@", line)
+
+        guard let path = Self.keyLogFile else { return }
+        let text = "[RDPKey] \(line)\n"
+        if let handle = FileHandle(forWritingAtPath: path) {
+            handle.seekToEndOfFile()
+            handle.write(Data(text.utf8))
+            handle.closeFile()
+        } else {
+            try? text.write(toFile: path, atomically: true, encoding: .utf8)
+        }
+    }
+
+    public override func resignFirstResponder() -> Bool {
+        releaseAllModifiers()
+        return super.resignFirstResponder()
+    }
+
+    // MARK: - 被 macOS 编辑菜单吃掉的组合键
+
+    /// macOS 应用自带「编辑」菜单，其中 Cut / Copy / Paste 持有 ⌘X / ⌘C / ⌘V 的快捷键，
+    /// 这些事件在到达视图之前就被菜单当 key equivalent 处理掉了 —— 远端收到的就是
+    /// 「什么都没发生」。而 ⌘A（Select All）恰好没被菜单占用，能正常落到 `keyDown`，
+    /// 于是现象很反直觉：**能全选，不能复制粘贴**。
+    ///
+    /// 这里用本地事件监听在分发之前把这些组合拦下来，按当前修饰键映射转成远端按键。
+    /// 只拦 keyDown，keyUp 仍走正常通道，因此不会漏发 release。
+    private func handleEditingShortcut(_ event: NSEvent) -> Bool {
+        // 只在渲染视图持有键盘焦点时接管，否则会抢掉应用自己文本框的复制粘贴
+        guard window?.isKeyWindow == true, window?.firstResponder === self else { return false }
+
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        // ⌃⌘ / ⌥⌘ 组合留给 macOS（如全屏 ⌃⌘F），只接管纯 Cmd（可带 Shift）的组合
+        guard flags.contains(.command), !flags.contains(.control), !flags.contains(.option) else {
+            return false
+        }
+        guard let key = event.charactersIgnoringModifiers?.lowercased(),
+              Self.editingShortcutKeys.contains(key)
+        else { return false }
+
+        // 这里必须自己补齐「抬起」：本地监听返回 nil 后，AppKit **不会**再投递这个键的
+        // keyUp（实测确认，见 `make key-check`）。只发按下不发抬起，远端会把这个键
+        // 永久当成按住状态 —— 表现为此后键盘整体失灵、点画面无效、只能重连。
+        forwardKey(event, down: true)
+        forwardKey(event, down: false)
+        return true
+    }
+
+    private func installShortcutMonitor() {
+        guard shortcutMonitor == nil else { return }
+        shortcutMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            let handled = MainActor.assumeIsolated { self?.handleEditingShortcut(event) ?? false }
+            return handled ? nil : event
+        }
+    }
+
+    private func removeShortcutMonitor() {
+        if let shortcutMonitor {
+            NSEvent.removeMonitor(shortcutMonitor)
+            self.shortcutMonitor = nil
+        }
+    }
+
+    public override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+
+        if let observer = resignKeyObserver {
+            NotificationCenter.default.removeObserver(observer)
+            resignKeyObserver = nil
+        }
+
+        guard let window else {
+            removeShortcutMonitor()
+            releaseAllModifiers()
+            return
+        }
+
+        installShortcutMonitor()
+
+        // 窗口失去 key 状态（切到别的应用）时，按住的修饰键抬起事件不会再送达，
+        // 必须主动补发，否则远端会卡着 Ctrl —— 见 reconcileModifiers
+        resignKeyObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.didResignKeyNotification,
+            object: window,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.releaseAllModifiers() }
+        }
+    }
+
+    deinit {
+        if let shortcutMonitor {
+            NSEvent.removeMonitor(shortcutMonitor)
+        }
+        if let resignKeyObserver {
+            NotificationCenter.default.removeObserver(resignKeyObserver)
+        }
     }
 
     private func forwardKey(_ event: NSEvent, down: Bool) {
+        logKey(event, note: down ? "keyDown" : "keyUp")
+        reconcileModifiers(with: event.modifierFlags)
+
         // 有扫描码映射的键走扫描码：保证 Ctrl/Alt 组合、功能键、方向键在远端语义正确
         if let scancode = KeyMapping.scancode(forMacVirtualKeyCode: event.keyCode,
                                               cmdBehavior: cmdKeyBehavior) {
@@ -358,13 +557,20 @@ public final class RDPRenderNSView: NSView {
         onUnicode?(codepoint, false)
     }
 
-    private func modifierIsDown(_ event: NSEvent) -> Bool {
-        switch event.keyCode {
-        case 55, 54: return event.modifierFlags.contains(.command)
-        case 56, 60: return event.modifierFlags.contains(.shift)
-        case 59, 62: return event.modifierFlags.contains(.control)
-        case 58, 61: return event.modifierFlags.contains(.option)
-        default:     return false
-        }
+    /// 键位日志：`RDP_KEYLOG=1` 打系统日志（`log stream`），
+    /// `RDP_KEYLOG=/tmp/rdpkey.log` 直接追加写文件（GUI 双击启动也能用）。
+    ///
+    /// 排查「某个组合键在远端没反应」时能立刻区分三种情况：
+    /// 事件没到视图（无日志）/ 映射不对（scancode 不符）/ 下发了但远端不响应。
+    private func logKey(_ event: NSEvent, note: String) {
+        guard Self.keyLogEnabled else { return }
+        let scancode = KeyMapping.scancode(forMacVirtualKeyCode: event.keyCode,
+                                           cmdBehavior: cmdKeyBehavior)
+        appendKeyLog(String(format: "%@ keyCode=%d scancode=%@ flags=0x%llx behavior=%@",
+                            note,
+                            Int(event.keyCode),
+                            scancode.map { String(format: "0x%04X", $0) } ?? "nil",
+                            event.modifierFlags.rawValue,
+                            cmdKeyBehavior.rawValue))
     }
 }

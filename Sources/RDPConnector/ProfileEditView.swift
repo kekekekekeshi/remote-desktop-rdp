@@ -99,7 +99,7 @@ struct ProfileEditView: View {
                 }
 
                 Section {
-                    Picker("Command 键", selection: $draft.value.cmdKeyBehavior) {
+                    Picker("修饰键映射", selection: $draft.value.cmdKeyBehavior) {
                         ForEach(CmdKeyBehavior.allCases) { behavior in
                             Text(behavior.displayName).tag(behavior)
                         }

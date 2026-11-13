@@ -23,7 +23,7 @@ BENCH_WIDTH   ?= 1920
 BENCH_HEIGHT  ?= 1080
 BENCH_FPS     ?= 30
 
-.PHONY: all build run app spike check bench cursor-check hover-check clipboard-check clean
+.PHONY: all build run app spike check bench cursor-check hover-check key-check clipboard-check clean
 
 all: build
 
@@ -67,6 +67,11 @@ bench:
 hover-check:
 	@swift build -c $(CONFIG) >/dev/null
 	@$$(swift build -c $(CONFIG) --show-bin-path)/rdpbridge-cli hover-check
+
+## 键位自检（被菜单吃掉的 ⌘C/⌘V 必须补齐抬起，否则远端卡键）
+key-check:
+	@swift build -c $(CONFIG) >/dev/null
+	@$$(swift build -c $(CONFIG) --show-bin-path)/rdpbridge-cli key-check
 
 ## 剪贴板双向自检（会真的连一次；打印每条 cliprdr 收发，不需要抓包）
 ##   make clipboard-check RDP_HOST=<ip> RDP_USER=<user> RDP_PASSWORD=<pw>
