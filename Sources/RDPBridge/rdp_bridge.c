@@ -114,6 +114,9 @@ struct RdpSession {
     /* 剪贴板 */
     CliprdrClientContext *cliprdr;
     char                 *clipboard_text; /* 本地待发送文本（UTF-8） */
+    /* 服务端是否已发过 Monitor Ready。这是剪贴板时序的起点：
+     * 在此之前的 Format List 会被服务端丢弃且不会重试。 */
+    BOOL                  clipboard_ready;
 };
 
 /* ------------------------------------------------------------------ */
@@ -278,8 +281,35 @@ static BOOL bridge_load_channels(freerdp *instance)
 /* 剪贴板（CLIPRDR，文本双向同步）                                        */
 /* ------------------------------------------------------------------ */
 
+#define RDP_CF_TEXT            1
+#define RDP_CF_OEMTEXT         7
 #define RDP_CF_UNICODETEXT     13
+#define RDP_CF_UNICODETEXT_NAME "UnicodeText" /* 标准格式的长名称，Windows 用它标识文本 */
 #define RDP_CLIPBOARD_MAX_BYTES (1024 * 1024) /* 1 MiB，超出直接丢弃 */
+
+/* 判断一个格式条目是不是 UTF-16 文本：优先看 formatId，其次看长格式名。
+ * 服务端（尤其 Windows 10+）在「长格式名」模式下可能用自定义 id + 名字来标识。 */
+static BOOL format_is_unicode_text(const CLIPRDR_FORMAT *format)
+{
+    if (!format)
+        return FALSE;
+    if (format->formatId == RDP_CF_UNICODETEXT)
+        return TRUE;
+    if (!format->formatName)
+        return FALSE;
+
+    /* ASCII 大小写无关比较（格式名不区分大小写） */
+    const char *a = format->formatName;
+    const char *b = RDP_CF_UNICODETEXT_NAME;
+    for (; *a && *b; ++a, ++b)
+    {
+        const char ca = (*a >= 'A' && *a <= 'Z') ? (char)(*a + 32) : *a;
+        const char cb = (*b >= 'A' && *b <= 'Z') ? (char)(*b + 32) : *b;
+        if (ca != cb)
+            return FALSE;
+    }
+    return *a == '\0' && *b == '\0';
+}
 
 /* UTF-16LE → UTF-8。返回 malloc 的字符串，调用方负责 free。 */
 static char *utf16le_to_utf8(const BYTE *data, size_t byteLen)
@@ -388,10 +418,17 @@ static BYTE *utf8_to_utf16le(const char *text, size_t *outLen)
     return out;
 }
 
+/* 剪贴板链路的日志标签：WLOG_LEVEL=info 起就会输出，用于定位
+ * 「哪一端没收到宣告 / 有没有来取数据」，不需要抓包。 */
+#define CLIPBOARD_LOG_TAG "com.eashion.rdpbridge.clipboard"
+
 /* 向服务端宣告本地有文本可粘贴 */
 static UINT bridge_cliprdr_advertise_text(RdpSession *session)
 {
-    if (!session || !session->cliprdr)
+    /* 必须等服务端发过 Monitor Ready。连接刚建立时上层可能已经把剪贴板推了过来，
+     * 这时宣告会被服务端丢掉、也没有重试机会 —— 表现就是「本地复制的内容在远端
+     * 粘不出来」。这里直接忽略，Monitor Ready 到达时会补发一次。 */
+    if (!session || !session->cliprdr || !session->clipboard_ready)
         return CHANNEL_RC_OK;
 
     EnterCriticalSection(&session->lock);
@@ -401,15 +438,35 @@ static UINT bridge_cliprdr_advertise_text(RdpSession *session)
     if (!hasText)
         return CHANNEL_RC_OK;
 
-    CLIPRDR_FORMAT format = { 0 };
-    format.formatId = RDP_CF_UNICODETEXT;
-    format.formatName = NULL;
+    /*
+     * 宣告与官方客户端（sdl-freerdp / xfreerdp）完全一致：
+     * CF_TEXT + CF_OEMTEXT + CF_UNICODETEXT，且**不带格式名**。
+     *
+     * 实测对照（同一台 Windows，rdpclip）：带标准名 "UnicodeText" 的宣告会被
+     * 接受（CB_FORMAT_LIST_RESPONSE = CB_RESPONSE_OK）却永远等不来取数，
+     * Windows 剪贴板里也登记不上（右键「粘贴」是灰的）；换成不带名的宣告后
+     * rdpclip 立刻连发 CB_FORMAT_DATA_REQUEST。长格式名模式下空名按 2 字节
+     * NUL 写出，三条共 26 字节，与官方客户端逐字节同长。
+     *
+     * rdpclip 会逐个取宣告过的格式（实测先 CF_TEXT 后 CF_UNICODETEXT），
+     * 所以三种都得能供数，见 ServerFormatDataRequest。
+     */
+    CLIPRDR_FORMAT formats[3];
+    formats[0].formatId   = RDP_CF_TEXT;
+    formats[0].formatName = NULL;
+    formats[1].formatId   = RDP_CF_OEMTEXT;
+    formats[1].formatName = NULL;
+    formats[2].formatId   = RDP_CF_UNICODETEXT;
+    formats[2].formatName = NULL;
+
+    WLog_INFO(CLIPBOARD_LOG_TAG,
+              "宣告本地剪贴板文本：CF_TEXT + CF_OEMTEXT + CF_UNICODETEXT（不带格式名）");
 
     CLIPRDR_FORMAT_LIST list = { 0 };
-    list.common.msgType = CB_FORMAT_LIST;
+    list.common.msgType  = CB_FORMAT_LIST;
     list.common.msgFlags = 0;
-    list.numFormats = 1;
-    list.formats = &format;
+    list.numFormats      = 3;
+    list.formats         = formats;
 
     return session->cliprdr->ClientFormatList(session->cliprdr, &list);
 }
@@ -419,26 +476,118 @@ static UINT bridge_cliprdr_monitor_ready(CliprdrClientContext *context,
 {
     (void)monitorReady;
     RdpSession *session = context ? (RdpSession *)context->custom : NULL;
+    if (!session)
+        return CHANNEL_RC_OK;
+
+    /* Monitor Ready 是剪贴板时序的起点：此后才允许宣告本地格式，
+     * 并把连接期间已经攒下的内容补发一次。 */
+    EnterCriticalSection(&session->lock);
+    session->clipboard_ready = TRUE;
+    LeaveCriticalSection(&session->lock);
+
+    WLog_INFO(CLIPBOARD_LOG_TAG, "服务端 Monitor Ready，剪贴板可用");
     return bridge_cliprdr_advertise_text(session);
 }
 
-/* 服务端宣告了可用格式：若含文本，主动请求内容 */
+/*
+ * 能力协商：服务端先声明它支持什么，客户端必须回一条自己的（MS-RDPECLIP 1.3.5.2）。
+ * Windows 一定会发这条（实测 generalFlags=0x3E：长格式名 + 文件流 + 锁 + 大文件）。
+ * 不回的话，服务端会按「它自己声明的能力」发我们并未实现的报文
+ * （例如带 clipDataId 的 Lock/Unlock ClipData），行为不可控。
+ * 这里只声明真正实现的：长格式名；其余留 0，服务端就不会启用那些扩展。
+ */
+static UINT bridge_cliprdr_server_capabilities(CliprdrClientContext *context,
+                                              const CLIPRDR_CAPABILITIES *capabilities)
+{
+    if (!context || !context->ClientCapabilities)
+        return CHANNEL_RC_OK;
+
+    UINT32 version = 2;
+    UINT32 flags   = 0;
+
+    /* capabilitySets 指向的是按长度串联的原生结构（不是指针数组） */
+    if (capabilities && capabilities->cCapabilitiesSets >= 1 && capabilities->capabilitySets)
+    {
+        const CLIPRDR_CAPABILITY_SET *base = capabilities->capabilitySets;
+        if (base->capabilitySetType == CB_CAPSTYPE_GENERAL)
+        {
+            const CLIPRDR_GENERAL_CAPABILITY_SET *general =
+                (const CLIPRDR_GENERAL_CAPABILITY_SET *)base;
+            if (general->version)
+                version = general->version;
+            flags = general->generalFlags & CB_USE_LONG_FORMAT_NAMES;
+
+            /* 排障用：RDP_CLIP_CAPS_MODE=none|echo|long 可切换回应策略 */
+            const char *mode = getenv("RDP_CLIP_CAPS_MODE");
+            if (mode)
+            {
+                if (strcmp(mode, "none") == 0)
+                    flags = 0;
+                else if (strcmp(mode, "echo") == 0)
+                    flags = general->generalFlags;
+            }
+        }
+    }
+
+    CLIPRDR_GENERAL_CAPABILITY_SET generalSet = { 0 };
+    generalSet.capabilitySetType   = CB_CAPSTYPE_GENERAL;
+    generalSet.capabilitySetLength = CB_CAPSTYPE_GENERAL_LEN;
+    generalSet.version             = version;
+    generalSet.generalFlags        = flags;
+
+    CLIPRDR_CAPABILITIES response = { 0 };
+    response.common.msgType    = CB_CLIP_CAPS;
+    response.common.msgFlags   = 0;
+    response.common.dataLen    = 0;
+    response.cCapabilitiesSets = 1;
+    response.capabilitySets    = (CLIPRDR_CAPABILITY_SET *)&generalSet;
+
+    WLog_INFO(CLIPBOARD_LOG_TAG, "回应服务端能力协商：version=%" PRIu32 " flags=0x%08X"
+                                 "（只声明长格式名，其余不启用）", version, flags);
+
+    return context->ClientCapabilities(context, &response);
+}
+
+/* 服务端宣告了可用格式：先按协议确认收到，若含文本再主动请求内容 */
 static UINT bridge_cliprdr_server_format_list(CliprdrClientContext *context,
                                               const CLIPRDR_FORMAT_LIST *formatList)
 {
     if (!context || !formatList)
         return CHANNEL_RC_OK;
 
+    /*
+     * 这一步是协议要求的：收到 Format List 必须回一条 Format List Response
+     * （MS-RDPBCGR 2.2.9.4.2 剪贴板通道时序）。FreeRDP 只负责解析和回调，
+     * 不会代发这条（见其 channels/cliprdr/client/cliprdr_format.c 里的
+     * cliprdr_process_format_list）。gnome-remote-desktop 对此宽容，
+     * Windows 的 cliprdr 则不会因为漏发而继续下发 Format Data ——
+     * 表现出来就是「同一个客户端连 Linux 能粘贴，连 Windows 粘不上」。
+     * 无论列表里有没有我们要的格式，都必须先确认。
+     */
+    CLIPRDR_FORMAT_LIST_RESPONSE response = { 0 };
+    response.common.msgType  = CB_FORMAT_LIST_RESPONSE;
+    response.common.msgFlags = CB_RESPONSE_OK;
+    response.common.dataLen  = 0;
+
+    UINT rc = context->ClientFormatListResponse(context, &response);
+    if (rc != CHANNEL_RC_OK)
+        return rc;
+
     for (UINT32 i = 0; i < formatList->numFormats; ++i) {
-        if (formatList->formats[i].formatId == RDP_CF_UNICODETEXT) {
+        if (format_is_unicode_text(&formatList->formats[i])) {
+            WLog_INFO(CLIPBOARD_LOG_TAG, "远端剪贴板有文本（formatId=0x%08X），请求内容",
+                      formatList->formats[i].formatId);
             CLIPRDR_FORMAT_DATA_REQUEST request = { 0 };
             request.common.msgType = CB_FORMAT_DATA_REQUEST;
             request.common.msgFlags = 0;
-            request.requestedFormatId = RDP_CF_UNICODETEXT;
+            /* 用服务端实际宣告的 formatId：长格式名模式下它可能不是 13 */
+            request.requestedFormatId = formatList->formats[i].formatId;
             return context->ClientFormatDataRequest(context, &request);
         }
     }
 
+    WLog_INFO(CLIPBOARD_LOG_TAG, "远端剪贴板宣告了 %" PRIu32 " 个格式，无文本格式",
+              formatList->numFormats);
     return CHANNEL_RC_OK;
 }
 
@@ -480,7 +629,14 @@ static UINT bridge_cliprdr_server_format_data_request(
     CLIPRDR_FORMAT_DATA_RESPONSE response = { 0 };
     response.common.msgType = CB_FORMAT_DATA_RESPONSE;
 
-    if (!session || request->requestedFormatId != RDP_CF_UNICODETEXT) {
+    const UINT32 requested = request->requestedFormatId;
+    /* 只供数宣告过的三种文本格式（宣告了什么就要能回什么） */
+    if (!session || (requested != RDP_CF_UNICODETEXT
+                     && requested != RDP_CF_TEXT
+                     && requested != RDP_CF_OEMTEXT)) {
+        WLog_INFO(CLIPBOARD_LOG_TAG,
+                  "远端来取剪贴板内容，但请求的是不支持的格式（formatId=0x%08X）",
+                  requested);
         response.common.msgFlags = CB_RESPONSE_FAIL;
         return context->ClientFormatDataResponse(context, &response);
     }
@@ -489,21 +645,58 @@ static UINT bridge_cliprdr_server_format_data_request(
     char *text = session->clipboard_text ? bridge_strdup(session->clipboard_text) : NULL;
     LeaveCriticalSection(&session->lock);
 
-    size_t byteCount = 0;
-    BYTE *utf16 = text ? utf8_to_utf16le(text, &byteCount) : NULL;
-    free(text);
-
-    if (!utf16) {
+    if (!text) {
+        WLog_INFO(CLIPBOARD_LOG_TAG, "远端来取内容，但本地没有可发送的文本");
         response.common.msgFlags = CB_RESPONSE_FAIL;
         return context->ClientFormatDataResponse(context, &response);
     }
 
+    BYTE *payload = NULL;
+    UINT32 dataLen = 0;
+    BOOL payloadIsText = FALSE;
+
+    if (requested == RDP_CF_UNICODETEXT) {
+        size_t byteCount = 0;
+        payload = (BYTE *)utf8_to_utf16le(text, &byteCount);
+        dataLen = (UINT32)byteCount;
+    } else {
+        /* CF_TEXT（ANSI）/ CF_OEMTEXT（OEM）：回 UTF-8 字节，含结尾 NUL。
+         * ASCII 内容与 ANSI 完全一致；含非 ASCII 时旧式 ANSI 应用可能乱码，
+         * 但现代应用一律读 CF_UNICODETEXT，不受影响。 */
+        dataLen = (UINT32)(strlen(text) + 1);
+        payload = (BYTE *)text;
+        payloadIsText = TRUE;
+    }
+
+    if (!payload) {
+        WLog_INFO(CLIPBOARD_LOG_TAG, "远端来取内容，但本地文本转换失败");
+        free(text);
+        response.common.msgFlags = CB_RESPONSE_FAIL;
+        return context->ClientFormatDataResponse(context, &response);
+    }
+
+    WLog_INFO(CLIPBOARD_LOG_TAG, "远端来取内容（formatId=0x%08X），回送 %u 字节",
+              requested, dataLen);
+
+    if (WLog_IsLevelActive(WLog_Get(CLIPBOARD_LOG_TAG), WLOG_DEBUG)) {
+        /* 头 32 字节的十六进制转储：非 ASCII 内容出问题时，先确认我们发出去的
+         * 字节是否正确（如「中」的 UTF-16LE 应为 2D 4E），再怀疑对端。 */
+        char hex[3 * 32 + 1] = { 0 };
+        const UINT32 dumpLen = dataLen < 32 ? dataLen : 32;
+        for (UINT32 k = 0; k < dumpLen; ++k)
+            (void)snprintf(hex + 3 * k, 4, "%02X ", payload[k]);
+        WLog_DBG(CLIPBOARD_LOG_TAG, "payload[:%u] = %s", dumpLen, hex);
+    }
+
     response.common.msgFlags = CB_RESPONSE_OK;
-    response.common.dataLen = (UINT32)byteCount;
-    response.requestedFormatData = utf16;
+    response.common.dataLen = dataLen;
+    response.requestedFormatData = payload;
 
     const UINT rc = context->ClientFormatDataResponse(context, &response);
-    free(utf16);
+    if (payloadIsText)
+        free(text);
+    else
+        free(payload);
     return rc;
 }
 
@@ -553,6 +746,7 @@ static void bridge_on_channel_connected(void *context, const ChannelConnectedEve
         cliprdr->custom = session;
 
         /* 覆盖默认回调，由本桥接层实现文本剪贴板 */
+        cliprdr->ServerCapabilities       = bridge_cliprdr_server_capabilities;
         cliprdr->MonitorReady             = bridge_cliprdr_monitor_ready;
         cliprdr->ServerFormatList         = bridge_cliprdr_server_format_list;
         cliprdr->ServerFormatDataRequest  = bridge_cliprdr_server_format_data_request;
@@ -583,6 +777,7 @@ static void bridge_on_channel_disconnected(void *context, const ChannelDisconnec
     if (strcmp(e->name, CLIPRDR_SVC_CHANNEL_NAME) == 0 && session) {
         /* 重定向会重建通道，旧上下文必须失效，避免悬空指针 */
         session->cliprdr = NULL;
+        session->clipboard_ready = FALSE;
     }
 }
 

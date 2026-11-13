@@ -207,6 +207,10 @@ final class SessionController: ObservableObject {
         stopClipboardSync()
         lastPasteboardChangeCount = NSPasteboard.general.changeCount
 
+        // 连接**之前**就复制好的内容也要能粘贴：轮询只关心「变化」，
+        // 所以启动时先把当前剪贴板推一次，否则用户得重新复制一遍。
+        pushCurrentPasteboard()
+
         let timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated {
                 self?.pollPasteboard()
@@ -225,9 +229,12 @@ final class SessionController: ObservableObject {
         let pasteboard = NSPasteboard.general
         guard pasteboard.changeCount != lastPasteboardChangeCount else { return }
         lastPasteboardChangeCount = pasteboard.changeCount
+        pushCurrentPasteboard()
+    }
 
+    private func pushCurrentPasteboard() {
         // MVP 只同步纯文本
-        guard let text = pasteboard.string(forType: .string), !text.isEmpty else { return }
+        guard let text = NSPasteboard.general.string(forType: .string), !text.isEmpty else { return }
         client.sendClipboardText(text)
     }
 }

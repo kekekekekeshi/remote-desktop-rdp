@@ -313,6 +313,95 @@ swift run rdpbridge-cli store-check | grep 滚轮    # 期望「滚轮标志编�
 > 另一处同类问题：`scrollWheel` 只读 `scrollingDeltaY`，
 > 于是两指左右滑动在远端完全没有反应 —— 见上表的 `PTR_FLAGS_HWHEEL`。
 
+## 剪贴板（文本，双向）
+
+文本剪贴板走 CLIPRDR 静态通道，两个方向都是「先宣告格式，按需再取内容」：
+
+| 方向 | 时序 |
+| --- | --- |
+| 本地 → 远端 | 轮询 `NSPasteboard`（0.5s）发现变化 → `CB_FORMAT_LIST` → 远端粘贴时服务端发 `CB_FORMAT_DATA_REQUEST` → 客户端回 `CB_FORMAT_DATA_RESPONSE`（UTF-16LE） |
+| 远端 → 本地 | 远端复制时服务端下发 `CB_FORMAT_LIST` → 客户端**必须**回 `CB_FORMAT_LIST_RESPONSE` → 客户端发 `CB_FORMAT_DATA_REQUEST` → 服务端回 `CB_FORMAT_DATA_RESPONSE` → 写进 `NSPasteboard` |
+
+三个容易踩的点（都已在实现里处理，注释见 `rdp_bridge.c` 的剪贴板一节）：
+
+1. **`CB_FORMAT_LIST_RESPONSE` 得自己发。** 协议要求收到 Format List 后必须确认
+   （MS-RDPBCGR 2.2.9.4.2），而 FreeRDP 只做解析和回调、不代发这条
+   （见其 `channels/cliprdr/client/cliprdr_format.c` 的 `cliprdr_process_format_list`）。
+   gnome-remote-desktop 对漏发宽容，Windows 的 cliprdr 不宽容 ——
+   差别就是「连 Linux 能粘贴、连 Windows 粘不上」。
+2. **标准文本格式不要带格式名，且要整族宣告。** 与官方客户端（sdl-freerdp）逐字节对齐后实测：
+   宣告 `CF_TEXT + CF_OEMTEXT + CF_UNICODETEXT` 且 `formatName = NULL`，rdpclip 收到就立即逐个来取数据；
+   而给 `CF_UNICODETEXT` 挂上标准名 `UnicodeText`（哪怕同时宣告整族）会被服务端
+   `CB_RESPONSE_OK` 接受、却永远不来取，Windows 剪贴板里登记不上（右键「粘贴」是灰的）。
+   反方向（远端→本地）则相反：服务端可能用自定义 id + 名字宣告文本，
+   取内容时要用它实际宣告的 `formatId`（见 `format_is_unicode_text`）。
+3. **连接之前就复制好的内容也要推一次。** 轮询只关心「变化」，
+   `startClipboardSync` 会先把当前剪贴板推过去，否则用户连上后得重新复制一遍。
+4. **宣告不能早于 Monitor Ready。** 服务端先发 Monitor Ready 才允许客户端宣告本地格式，
+   更早发出的 Format List 会被丢弃且不会重试。上面第 3 点的推送可能就早于它，
+   所以桥接层用 `clipboard_ready` 做闸门：没就绪就先只存文本，Monitor Ready 到达时补发一次。
+
+范围：只同步纯文本（图片 / RTF / 文件列表未实现），单条上限 1 MiB；
+换行符不做转换（Windows 是 CRLF、Linux 是 LF，交由两端应用处理，mstsc 同样不转）。
+
+自检（会真的连一次；两个方向各有一步需要人工配合的动作，输出里会提示做什么）：
+
+```bash
+make clipboard-check RDP_HOST=<ip> RDP_USER=<user> RDP_PASSWORD=<pw>
+# 日志级别默认 info，足够看到整条链路；需要每条 PDU 就 WLOG_LEVEL=DEBUG make clipboard-check ...
+```
+
+按这几行判断卡在哪一步（标签 `com.eashion.rdpbridge.clipboard`）：
+
+| 日志 | 含义 |
+| --- | --- |
+| `服务端 Monitor Ready，剪贴板可用` | 通道就绪。没有这行，之后所有宣告都会被忽略 |
+| `宣告本地剪贴板文本：CF_TEXT + CF_OEMTEXT + CF_UNICODETEXT（不带格式名）` | 本地→远端已通知服务端 |
+| `远端来取内容（formatId=…），回送 N 字节` | 本地→远端完成（宣告后 rdpclip 通常立即连取 CF_TEXT 与 CF_UNICODETEXT） |
+| `远端剪贴板有文本（formatId=…），请求内容` | 远端→本地已发起 |
+| `远端剪贴板宣告了 N 个格式，无文本格式` | 远端复制的是图片/文件等，当前只支持文本 |
+
+「有宣告、没有来取」两种可能，都实测过：
+
+1. **宣告带了标准格式名。** 给 `CF_UNICODETEXT` 挂上 `UnicodeText` 后，Windows 会回
+   `CB_FORMAT_LIST_RESPONSE = CB_RESPONSE_OK`（接受）却永远不来取，剪贴板里也登记不上
+   （右键「粘贴」是灰的）。对照：同一台机器上官方 sdl-freerdp 用「不带名」的宣告，
+   rdpclip 立即连取 `CF_TEXT` 与 `CF_UNICODETEXT`。修复就是去掉格式名并整族宣告（见第 2 点）。
+2. **真的是远端策略。** 若带不带名都不来取，且远端复制时它对我们的数据请求回
+   `CB_FORMAT_DATA_RESPONSE = CB_RESPONSE_FAIL`（自己给不出内容），那就是
+   `rdpclip.exe` 状态异常或云桌面/DLP 的「单向剪贴板」策略（公司云桌面里很常见）。
+   判别：用 mstsc 连同一台试「本地→远端」，同样粘不进去就不是本客户端的问题。
+
+排障开关（只用于本机调试，不改变默认行为）：`RDP_CLIP_CAPS_MODE=none|echo|long` 切换能力协商回应，
+`RDP_CLIP_PUSH_DELAY=<秒>` 改变宣告时机，
+`RDP_SNAPSHOT_DIR=<目录>` 在关键步骤导出远端画面，`RDP_CLIPBOARD_PROBE=1` 让自检自动驱动远端粘贴。
+
+### 已知远端问题：GNOME（gnome-remote-desktop）粘贴非 ASCII 变 `\uXXXX`
+
+本端发出的数据是正确的 UTF-16LE（`make clipboard-check ... WLOG_LEVEL=DEBUG` 会打印
+`payload[:N] = 2D 4E …`，「中」= U+4E2D → `2D 4E`），但 gnome-remote-desktop 在把客户端内容
+转成 Wayland 剪贴板时走了 WinPR 的 `text/plain` 合成格式——该格式在非 Windows 平台上
+被 WinPR 定义为「ASCII + `\uXXXX` 转义」（见其 `winpr/libwinpr/clipboard/synthetic.c`
+中 `clipboard_synthesize_string` 的注释），于是中文变成 `\u4e2d\u6587`。
+
+GRD 的出错点在 `src/grd-clipboard-rdp.c` 的 `convert_client_content_for_server()`：
+
+```c
+case GRD_MIME_TYPE_TEXT_PLAIN_UTF8:
+case GRD_MIME_TYPE_TEXT_UTF8_STRING:
+  is_null_terminated = TRUE;
+  dst_format_id = ClipboardGetFormatId (clipboard_rdp->system,
+                                        "text/plain");        /* ← 应为 "text/plain;charset=utf-8" */
+```
+
+这影响**所有** RDP 客户端（mstsc / Remmina / 官方 FreeRDP 同样如此），不是本客户端的问题；
+Windows 主机不受影响（转换由 rdpclip 完成）。客户端侧无解——转换目标写死在 GRD 里，
+与客户端宣告什么格式无关。可行的处理：
+
+- 在自己的 Ubuntu 上给 GRD 打一行补丁重编（把上面那处的 `"text/plain"` 换成
+  `"text/plain;charset=utf-8"`，`mime_text_utf8` 常量等价）；
+- 或向上游报 issue（可引用上面两处源码：GRD 的取值 + WinPR 的转义注释）。
+
 ## 渲染后端
 
 画面渲染有两套可运行时切换的后端，在会话窗口的顶部抽屉里切换（选择会持久化）：
@@ -393,28 +482,25 @@ make bench BENCH_SECONDS=8 BENCH_WIDTH=2560 BENCH_HEIGHT=1440
 
 ### 剪贴板不工作（复制粘贴没反应）
 
-**九成是 Command 键映射的问题。** 在远端里必须按 **`Ctrl+C` / `Ctrl+V`**，
-按 `Cmd+C` / `Cmd+V` 在默认配置下是**无效**的（Cmd 被当成 Win 键发过去，
-GNOME 收到 `Win+C` / `Win+V` 什么都不做）。
+**先确认按键映射。** 默认配置是「Cmd 当 Ctrl」，所以 `Cmd+C` / `Cmd+V` 直接生效。
+若这条配置被改成了 **Win 键**，远端收到的是 `Win+C` / `Win+V`，什么都不会发生 ——
+此时要么在远端改用 `Ctrl+C` / `Ctrl+V`，要么把「键盘 → Command 键」改回 Ctrl。
 
-两种解法，任选其一：
-
-- 配置里把「键盘 → Command 键」改成 **Ctrl**（推荐）。之后 `Cmd+C` / `Cmd+V`
-  就按 Linux 习惯生效，代价是失去远端的 Win 键（Super）
-- 保持默认，在远端里改用 `Ctrl+C` / `Ctrl+V`
-
-排除这一条之后如果仍然不通，检查：
+再检查：
 
 1. 配置里「启用剪贴板同步」是否勾选
 2. **远端剪贴板得先有内容**。远端→本地是服务端在剪贴板**变化时**才下发的：
-   在 Ubuntu 侧复制一次，Mac 这边才会收到。GDM 登录页上没有可复制的东西，
+   在远端复制一次，Mac 这边才会收到。GDM 登录页上没有可复制的东西，
    所以那个阶段远端→本地必然是空的
-3. 自检工具可以看协议层是否通（会真的连一次）：
+3. 连接之前复制的内容也会在下一次 `Cmd+C` 时推送；只想用早已复制好的内容，
+   连上后重新复制一次（启动时会主动推一次当前剪贴板，见「剪贴板（文本，双向）」）
+4. Windows 主机：协议时序里有一条必须客户端自己发的 `CB_FORMAT_LIST_RESPONSE`，
+   漏发时 Windows 不会下发内容（Linux 服务端则会照常下发）—— 见「剪贴板（文本，双向）」第 1 点
+5. 自检工具可以看协议层是否通（会真的连一次），并且直接打印链路各步是否走到：
 
 ```bash
-swift run rdpbridge-cli kit-check <host> <user> <password> 15
-# 期望看到：[剪贴板] 推送本地文本: ... 且不报错
-# 用 WLOG_LEVEL=DEBUG 可看到 cliprdr 报文
+make clipboard-check RDP_HOST=<ip> RDP_USER=<user> RDP_PASSWORD=<pw>
+# 对照「剪贴板（文本，双向）」里的日志表，能判断是「没宣告」还是「服务端没来取」
 ```
 
 ### 提示「服务端结束了会话」(`ERRINFO_LOGOFF_BY_USER`)

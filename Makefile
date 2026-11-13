@@ -23,7 +23,7 @@ BENCH_WIDTH   ?= 1920
 BENCH_HEIGHT  ?= 1080
 BENCH_FPS     ?= 30
 
-.PHONY: all build run app spike check bench cursor-check hover-check clean
+.PHONY: all build run app spike check bench cursor-check hover-check clipboard-check clean
 
 all: build
 
@@ -67,6 +67,18 @@ bench:
 hover-check:
 	@swift build -c $(CONFIG) >/dev/null
 	@$$(swift build -c $(CONFIG) --show-bin-path)/rdpbridge-cli hover-check
+
+## 剪贴板双向自检（会真的连一次；打印每条 cliprdr 收发，不需要抓包）
+##   make clipboard-check RDP_HOST=<ip> RDP_USER=<user> RDP_PASSWORD=<pw>
+##   默认会驱动一次远端：Win+R 打开「运行」→ 粘贴 → 复制回来，比对文本（ROUNDTRIP=0 关闭）
+##   注意 Windows 的端口非 3389 时，把端口写进 RDP_HOST（如 host:3388 需自行改 kit-check 参数）
+clipboard-check:
+	@if [ -z "$(RDP_HOST)" ] || [ -z "$(RDP_PASSWORD)" ]; then \
+		echo "用法: make clipboard-check RDP_HOST=<ip> RDP_USER=<user> RDP_PASSWORD=<pw> [CLIPBOARD_SECONDS=30] [ROUNDTRIP=0]"; exit 1; fi
+	@swift build -c $(CONFIG) >/dev/null
+	@WLOG_LEVEL=$${WLOG_LEVEL:-info} RDP_CLIPBOARD_PROBE=$${ROUNDTRIP:-1} \
+		$$(swift build -c $(CONFIG) --show-bin-path)/rdpbridge-cli \
+		kit-check "$(RDP_HOST)" "$(RDP_USER)" "$(RDP_PASSWORD)" $${CLIPBOARD_SECONDS:-30}
 
 ## 光标合成自检（像素级验证 + 导出 PNG 供目视）
 cursor-check:

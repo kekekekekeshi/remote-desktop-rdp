@@ -922,6 +922,15 @@ func runKitCheck(host: String, user: String, password: String,
     let stats = Stats()
     let client = RDPClient()
 
+    /// 记下最近一次远端下发的剪贴板文本，用于自动往返比对（跨线程，加锁）
+    final class RemoteClipboardSink {
+        private let lock = NSLock()
+        private var value: String?
+        func note(_ text: String) { lock.lock(); value = text; lock.unlock() }
+        func current() -> String? { lock.lock(); defer { lock.unlock() }; return value }
+    }
+    let remoteClipboard = RemoteClipboardSink()
+
     client.onEvent = { event in
         switch event {
         case .connecting:                  print("[事件] connecting")
@@ -929,7 +938,9 @@ func runKitCheck(host: String, user: String, password: String,
         case .disconnected:                print("[事件] disconnected")
         case .error(let message):          print("[事件] error: \(RDPErrorHint.enrich(message))")
         case .certificateUntrusted(let f): print("[事件] certificateUntrusted: \(f)")
-        case .clipboardText(let text):     print("[事件] clipboard: \(text.prefix(40))")
+        case .clipboardText(let text):
+            print("[事件] clipboard: \(text.prefix(40))")
+            remoteClipboard.note(text)
         case .desktopResize(let w, let h): print("[事件] resize: \(w)x\(h)")
         case .cursorChanged(let cursor):
             if let cursor {
@@ -945,10 +956,19 @@ func runKitCheck(host: String, user: String, password: String,
     client.onFrame = { frame in
         let previous = stats.frames
         stats.addFrame(width: Int32(frame.width), height: Int32(frame.height))
+        latestFrame.store(frame)   // 供 RDP_SNAPSHOT_DIR 在关键步骤后导出画面
         if previous == 0 {
             print("[帧] 首帧 \(frame.width)x\(frame.height) stride=\(frame.stride) "
                   + "bytes=\(frame.pixels.count)")
         }
+    }
+
+    /// 关键步骤后留一张远端画面，用于确认「按键到底有没有落到目标上」
+    let snapshotDir = ProcessInfo.processInfo.environment["RDP_SNAPSHOT_DIR"]
+    func snapshot(_ name: String) {
+        guard let snapshotDir, let frame = latestFrame.latest else { return }
+        let path = snapshotDir + "/clip-" + name + ".png"
+        print("[截图] \(path) \(writePNG(frame, to: path) ? "已写出" : "失败")")
     }
 
     do {
@@ -964,16 +984,94 @@ func runKitCheck(host: String, user: String, password: String,
         exit(1)
     }
 
-    // 剪贴板冒烟测试：连接稳定后推送一段文本，并读回远端剪贴板
-    DispatchQueue.global().asyncAfter(deadline: .now() + 4) {
-        let probe = "rdpconnector-clipboard-probe"
-        print("[剪贴板] 推送本地文本: \(probe)")
-        client.sendClipboardText(probe)
+    // 剪贴板自检。服务端只有在远端应用真的粘贴时才会来取内容，所以「通不通」
+    // 必须在远端有一个能粘贴的目标才能证明：
+    //   RDP_CLIPBOARD_PROBE=1 → 自动往返：Win+R 打开「运行」对话框（焦点必定落在它的
+    //     输入框）→ Ctrl+A / Ctrl+V 粘贴 → Ctrl+A / Ctrl+C 复制回来。
+    //     回来的文本等于推过去的文本，就同时证明了本地→远端与远端→本地。
+    //   不设 → 只推送文本，并提示人工做那一步。
+    // 每条 PDU 的往来用 WLOG_LEVEL=debug 看。
+    // 探针刻意含中文：非 ASCII 内容能暴露「按字节当字符」一类乱码问题
+    let probeText = "rdp剪贴板-中文-\(UUID().uuidString.prefix(8))"
+    let autoProbe = ProcessInfo.processInfo.environment["RDP_CLIPBOARD_PROBE"] == "1"
 
-        DispatchQueue.global().asyncAfter(deadline: .now() + 3) {
-            let remote = NSPasteboard.general.string(forType: .string) ?? "(空)"
-            print("[剪贴板] 本地剪贴板当前内容: \(remote.prefix(60))")
+    /// 只用到自检需要的几个字母，按本地键码映射
+    func typeWord(_ word: String) {
+        let map: [Character: UInt16] = [
+            "a": 0, "d": 2, "e": 14, "n": 45, "o": 31, "p": 35, "t": 17,
+        ]
+        for ch in word {
+            if let key = map[ch] { press(key) }
         }
+    }
+
+    /// 按一个组合键（走扫描码，与真实键盘同一条路径）
+    func press(_ macKey: UInt16, ctrl: Bool = false, win: Bool = false, alt: Bool = false,
+               hold: TimeInterval = 0.04) {
+        let ctrlCode: UInt16 = 0x1D                          // 左 Ctrl
+        let altCode: UInt16  = 0x38                          // 左 Alt
+        let winCode: UInt16 = 0x5B | KeyMapping.extendedFlag  // 左 Win（扩展键）
+
+        // down/up 之间留一点间隔：真实键盘至少几十毫秒，全挤在一起时远端不一定收得到。
+        func send(_ code: UInt16, _ down: Bool) {
+            client.sendKey(scancode: code, down: down)
+            Thread.sleep(forTimeInterval: hold)
+        }
+
+        if ctrl { send(ctrlCode, true) }
+        if alt  { send(altCode, true) }
+        if win  { send(winCode, true) }
+        if let code = KeyMapping.scancode(forMacVirtualKeyCode: macKey, cmdBehavior: .control) {
+            send(code, true)
+            send(code, false)
+        }
+        if win  { send(winCode, false) }
+        if alt  { send(altCode, false) }
+        if ctrl { send(ctrlCode, false) }
+    }
+
+
+    // 推送时机也可调：RDP_CLIP_PUSH_DELAY=0.3 时，文本在通道就绪前就存好，
+    // 由 Monitor Ready 一到就立即宣告 —— 与 app 里的真实时序一致。
+    let pushDelay = ProcessInfo.processInfo.environment["RDP_CLIP_PUSH_DELAY"]
+        .flatMap(Double.init) ?? 4.0
+
+    DispatchQueue.global().asyncAfter(deadline: .now() + pushDelay) {
+        print("[剪贴板] 本地→远端：推送 \(probeText)（延迟 \(pushDelay)s）")
+        client.sendClipboardText(probeText)
+
+        guard autoProbe else {
+            DispatchQueue.global().asyncAfter(deadline: .now() + 6) {
+                print("[剪贴板] 请在远端的文本框里按 Ctrl+V，应能看到上面那段文本；")
+                print("         再在远端 Ctrl+C 复制别的文本，本端应打印 [事件] clipboard: ...")
+                let local = NSPasteboard.general.string(forType: .string) ?? "(空)"
+                print("[剪贴板] 本地剪贴板当前内容: \(local.prefix(60))")
+            }
+            return
+        }
+
+        // 判据是日志里有没有「远端来取内容，回送 …」：Windows 只在目标应用真的取剪贴板时
+        // 才发 CB_FORMAT_DATA_REQUEST。靶子用记事本（窗口大、结果能截图核对）。
+        print("[剪贴板] 自动探测：Win+R → notepad → 回车 → Ctrl+V →（截图）→ Alt+F4")
+        press(15, win: true)                       // Win+R
+        Thread.sleep(forTimeInterval: 1.5)
+        press(0, ctrl: true)                       // Ctrl+A 清掉上次留下的内容
+        typeWord("notepad")
+        press(36, hold: 0.15)                      // 回车：打开记事本
+        Thread.sleep(forTimeInterval: 4.0)
+        press(9, ctrl: true)                       // Ctrl+V
+        Thread.sleep(forTimeInterval: 2.0)
+        snapshot("notepad-after-paste")            // 记事本里应能看到推送的文本
+        press(118, alt: true)                      // Alt+F4：有内容时会弹「保存更改」对话框
+        Thread.sleep(forTimeInterval: 1.0)
+        press(53)                                  // Esc 取消关闭 —— 记事本留着，方便你亲自核对
+        print("[剪贴板] 记事本窗口留在远端（未保存），可直接看里面有没有那段文本")
+
+        let back = remoteClipboard.current()
+        let verdict = (back == probeText) ? "✅ 两个方向都通" : "❌ 没能取回，见上面的 cliprdr 日志"
+        print("[剪贴板] 往返结果: 推送=\(probeText)"
+              + " 回来=\(back.map { String($0.prefix(40)) } ?? "无") → \(verdict)")
+        press(53)                                  // Esc 关掉「运行」对话框
     }
 
     // 输入 / 光标冒烟测试。
