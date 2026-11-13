@@ -252,16 +252,41 @@ RDP 的滚轮事件（MS-RDPBCGR 2.2.8.1.1.3.1）有个反直觉之处：
 负向旋转按 9 位二进制补码存放（低 8 位 = `0x100 − 步数`）。
 x/y 在滚轮事件中被服务端忽略，填真实指针坐标即可。
 
+**两条轴都要转发**：竖向用 `PTR_FLAGS_WHEEL`（0x0200），横向用
+`PTR_FLAGS_HWHEEL`（0x0400）—— 两者互斥（规范规定 HWHEEL 仅在 WHEEL 未置位时有效），
+同时置位会被服务端按竖向解析，左右两指滑动就消失了。
+
 | 方向 | pointerFlags |
 | --- | --- |
 | 上滚一格 | `0x0278`（PTR_FLAGS_WHEEL \| 120） |
 | 下滚一格 | `0x0388`（PTR_FLAGS_WHEEL \| PTR_FLAGS_WHEEL_NEGATIVE \| 0x88） |
+| 右滚一格 | `0x0478`（PTR_FLAGS_HWHEEL \| 120） |
+| 左滚一格 | `0x0588`（PTR_FLAGS_HWHEEL \| PTR_FLAGS_WHEEL_NEGATIVE \| 0x88） |
 
 mstsc 抓包与 FreeRDP 官方 macOS 客户端（`MRDPView.m`）均按此编码。
+低 9 位最大 255，即单条 PDU 最多两格；`rdp_send_mouse_wheel` 把更多格拆成多条 PDU，
+而不是截断丢弃。
+
+自检（纯编码，不需要真实会话）：
+
+```bash
+swift run rdpbridge-cli store-check | grep 滚轮    # 期望「滚轮标志编码: ✅」
+```
+
+### 触摸板增量换算
+
+触摸板是「精确像素」增量（`hasPreciseScrollingDeltas`，一次事件常常只有 1~3 px），
+而 RDP 只有整格滚轮。一个事件发一格会让远端滚动速度失控，
+所以 `RDPRenderNSView` 对两条轴各自累积，攒够 `pixelsPerWheelNotch`（默认 30 px/格）
+再发；反向滑动时丢弃旧余量（避免两方向抵消成「不动」），惯性结束时补发不足一格的零头。
+硬件滚轮（非精确增量）仍是一格一转，不经过累积。
 
 > 踩坑记录：早期实现把步数放进 x 字段、flags 低 8 位留空，
 > 结果上滚被服务端解读为「旋转量 0」直接丢弃，下滚被解读为 −256 的巨幅旋转而"碰巧可用" ——
 > 表现为**触摸板只能下翻、不能上翻**。修复见 `rdp_send_mouse_wheel`。
+>
+> 另一处同类问题：`scrollWheel` 只读 `scrollingDeltaY`，
+> 于是两指左右滑动在远端完全没有反应 —— 见上表的 `PTR_FLAGS_HWHEEL`。
 
 ## 渲染后端
 

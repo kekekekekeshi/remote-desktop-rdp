@@ -1305,36 +1305,62 @@ void rdp_send_mouse_button(RdpSession *session, int button, bool down, uint16_t 
     LeaveCriticalSection(&session->lock);
 }
 
-void rdp_send_mouse_wheel(RdpSession *session, int delta, uint16_t x, uint16_t y)
+/*
+ * 滚轮事件的 pointerFlags 编码。
+ *
+ * 「旋转量」不在 x/y 字段，而是放在 pointerFlags 的低 9 位：低 8 位是旋转量
+ * （一格 = 120），bit8 是符号位（PTR_FLAGS_WHEEL_NEGATIVE），负向按 9 位补码
+ * 存放（低 8 位 = 0x100 − 步数）。服务端按此解析（mstsc 抓包：上滚
+ * flags=0x0278、下滚 flags=0x0388；FreeRDP 官方 macOS 客户端同款实现）。
+ * 若把步数放进 x 字段而 flags 低 8 位为 0，上滚会因旋转量为 0 被丢弃，
+ * 下滚则被解读为 -256 的巨幅旋转——表现为「只能下翻、不能上翻」。
+ *
+ * 竖向用 PTR_FLAGS_WHEEL(0x0200)，横向用 PTR_FLAGS_HWHEEL(0x0400)。
+ * 两者互斥（MS-RDPBCGR：HWHEEL 仅在 WHEEL 未置位时有效），同时置位会被
+ * 服务端按竖向解析，横向滚动就消失了。正值表示向上 / 向右。
+ */
+#define RDP_WHEEL_NOTCH_UNITS 120 /* 一格 = 120 */
+#define RDP_WHEEL_MAX_NOTCHES 2   /* 低 9 位上限 255，故单条 PDU 最多两格 */
+
+uint16_t rdp_bridge_wheel_flags(int notches, bool horizontal)
 {
-    if (!session || !session->lock_ready)
+    if (notches > RDP_WHEEL_MAX_NOTCHES)
+        notches = RDP_WHEEL_MAX_NOTCHES;
+    if (notches < -RDP_WHEEL_MAX_NOTCHES)
+        notches = -RDP_WHEEL_MAX_NOTCHES;
+
+    const bool negative = notches < 0;
+    int units = (negative ? -notches : notches) * RDP_WHEEL_NOTCH_UNITS;
+    if (negative)
+        units = 0x100 - units;
+
+    UINT16 flags = horizontal ? PTR_FLAGS_HWHEEL : PTR_FLAGS_WHEEL;
+    if (negative)
+        flags |= PTR_FLAGS_WHEEL_NEGATIVE;
+    return flags | (UINT16)units;
+}
+
+void rdp_send_mouse_wheel(RdpSession *session, int delta, uint16_t x, uint16_t y, bool horizontal)
+{
+    if (!session || !session->lock_ready || delta == 0)
         return;
 
-    /*
-     * RDP 滚轮事件的「旋转量」编码在 pointerFlags 低 9 位（ROTATE_MASK 低 8 位
-     * + bit8 符号位），而不是 x 字段：一格 = 120，负向旋转按 9 位二进制补码
-     * 存放（低 8 位 = 0x100 - 步数）。服务端按此解析（mstsc 抓包：上滚
-     * flags=0x0278、下滚 flags=0x0388；FreeRDP 官方 macOS 客户端同款实现）。
-     * 若把步数放进 x 字段而 flags 低 8 位为 0，上滚会因旋转量为 0 被丢弃，
-     * 下滚则被解读为 -256 的巨幅旋转——表现为「只能下翻、不能上翻」。
-     * 本 API 的 delta 单位为格，正值表示向上/向左。
-     */
-    int steps = delta * 120;
-    UINT16 flags = PTR_FLAGS_WHEEL;
-    if (steps < 0) {
-        flags |= PTR_FLAGS_WHEEL_NEGATIVE;
-        steps = -steps;
-    }
-    if (steps > 0xFF)
-        steps = 0xFF;
-    if (flags & PTR_FLAGS_WHEEL_NEGATIVE)
-        steps = 0x100 - steps;
-    flags |= (UINT16)steps;
+    /* 超过两格的部分拆成多条 PDU，而不是截断丢弃（快速甩动时不丢滚动量） */
+    int notches = delta < 0 ? -delta : delta;
+    if (notches > 20)
+        notches = 20;
 
     EnterCriticalSection(&session->lock);
     rdpInput *input = session_input(session);
-    if (input)
-        freerdp_input_send_mouse_event(input, flags, x, y);
+    if (input) {
+        for (int remaining = notches; remaining > 0;) {
+            const int chunk = remaining > RDP_WHEEL_MAX_NOTCHES ? RDP_WHEEL_MAX_NOTCHES : remaining;
+            remaining -= chunk;
+            const UINT16 flags =
+                rdp_bridge_wheel_flags(delta < 0 ? -chunk : chunk, horizontal);
+            freerdp_input_send_mouse_event(input, flags, x, y);
+        }
+    }
     LeaveCriticalSection(&session->lock);
 }
 

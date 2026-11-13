@@ -125,8 +125,8 @@ final class SessionController: ObservableObject {
         client.sendMouseButton(button, down: down, x: x, y: y)
     }
 
-    func sendMouseWheel(delta: Int32, x: UInt16, y: UInt16) {
-        client.sendMouseWheel(delta: delta, x: x, y: y)
+    func sendMouseWheel(delta: Int32, x: UInt16, y: UInt16, horizontal: Bool) {
+        client.sendMouseWheel(delta: delta, x: x, y: y, horizontal: horizontal)
     }
 
     func sendKey(scancode: UInt16, down: Bool) { client.sendKey(scancode: scancode, down: down) }

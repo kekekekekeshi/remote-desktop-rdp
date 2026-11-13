@@ -271,8 +271,10 @@ public final class RDPClient {
         withSession { rdp_send_mouse_button($0, button, down, x, y) }
     }
 
-    public func sendMouseWheel(delta: Int32, x: UInt16, y: UInt16) {
-        withSession { rdp_send_mouse_wheel($0, delta, x, y) }
+    /// 滚轮 / 触摸板滚动。`horizontal` 为真时走 RDP 的横向滚轮标志。
+    /// delta 单位为「格」，正值表示向上（竖向）或向右（横向）。
+    public func sendMouseWheel(delta: Int32, x: UInt16, y: UInt16, horizontal: Bool) {
+        withSession { rdp_send_mouse_wheel($0, delta, x, y, horizontal) }
     }
 
     public func sendKey(scancode: UInt16, down: Bool) {

@@ -784,6 +784,18 @@ func runStoreCheck() {
           + " Cmd→Win=0x\(cmdAsWin.map { String($0, radix: 16) } ?? "nil")"
           + " C→0x\(letterC.map { String($0, radix: 16) } ?? "nil")")
 
+    // 滚轮标志编码：竖向 PTR_FLAGS_WHEEL / 横向 PTR_FLAGS_HWHEEL（互斥），
+    // 旋转量放 flags 低 9 位（一格 120，负向按 9 位补码）——与 README 的表一致
+    let wheelUp = Int(rdp_bridge_wheel_flags(1, false))
+    let wheelDown = Int(rdp_bridge_wheel_flags(-1, false))
+    let wheelRight = Int(rdp_bridge_wheel_flags(1, true))
+    let wheelLeft = Int(rdp_bridge_wheel_flags(-1, true))
+    let wheelOK = wheelUp == 0x0278 && wheelDown == 0x0388
+        && wheelRight == 0x0478 && wheelLeft == 0x0588
+    print("滚轮标志编码: \(wheelOK ? "✅" : "❌")"
+          + " 上=0x\(String(wheelUp, radix: 16)) 下=0x\(String(wheelDown, radix: 16))"
+          + " 右=0x\(String(wheelRight, radix: 16)) 左=0x\(String(wheelLeft, radix: 16))")
+
     // 旧版配置文件兼容：profiles.json 里没有 cmdKeyBehavior 字段时也必须能加载。
     // 手写 Codable init 就是为此 —— 用合成的 decoder 会因 keyNotFound 抛错，
     // 导致升级后整个配置列表加载失败（用户看到「配置全没了」）。
@@ -1065,7 +1077,8 @@ func probeInput(session: OpaquePointer, width: Int32, height: Int32) {
     if env["RDP_NO_CLICK"] != "1" {
         rdp_send_mouse_button(session, Int32(RDP_MOUSE_LEFT), true, cx + 20, cy + 20)
         rdp_send_mouse_button(session, Int32(RDP_MOUSE_LEFT), false, cx + 20, cy + 20)
-        rdp_send_mouse_wheel(session, 1, cx, cy)
+        rdp_send_mouse_wheel(session, 1, cx, cy, false)      // 上滚一格
+        rdp_send_mouse_wheel(session, -1, cx, cy, true)      // 向左滚一格（横向轴）
     }
 
     if env["RDP_NO_UNICODE"] != "1" {
@@ -1080,10 +1093,10 @@ func probeInput(session: OpaquePointer, width: Int32, height: Int32) {
 
     // Ctrl+Alt+Del 会让 GDM 登出会话，做光标诊断时跳过（RDP_NO_CAD=1）
     if ProcessInfo.processInfo.environment["RDP_NO_CAD"] == "1" {
-        print("[输入] 已注入 鼠标/滚轮/字符/Shift（已跳过 Ctrl+Alt+Del），无崩溃")
+        print("[输入] 已注入 鼠标/竖向滚轮/横向滚轮/字符/Shift（已跳过 Ctrl+Alt+Del），无崩溃")
     } else {
         rdp_send_ctrl_alt_del(session)
-        print("[输入] 已注入 鼠标/滚轮/字符/Shift/Ctrl+Alt+Del，无崩溃")
+        print("[输入] 已注入 鼠标/竖向滚轮/横向滚轮/字符/Shift/Ctrl+Alt+Del，无崩溃")
     }
 
     if env["RDP_NO_RESIZE"] != "1" {

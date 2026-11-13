@@ -153,7 +153,18 @@ void rdp_session_disconnect(RdpSession *session);
 
 void rdp_send_mouse_move(RdpSession *session, uint16_t x, uint16_t y);
 void rdp_send_mouse_button(RdpSession *session, int button, bool down, uint16_t x, uint16_t y);
-void rdp_send_mouse_wheel(RdpSession *session, int delta, uint16_t x, uint16_t y);
+
+/*
+ * 滚轮 / 触摸板滚动。delta 单位为「格」，正值表示向上（horizontal=false）
+ * 或向右（horizontal=true）；横向走 PTR_FLAGS_HWHEEL，与竖向互斥。
+ */
+void rdp_send_mouse_wheel(RdpSession *session, int delta, uint16_t x, uint16_t y, bool horizontal);
+
+/*
+ * 滚轮事件的 pointerFlags 编码，单独暴露只为可离线自检（见 rdpbridge-cli store-check）。
+ * 一条 PDU 最多表达两格（flags 低 9 位上限 255），多出的部分由调用方拆分。
+ */
+uint16_t rdp_bridge_wheel_flags(int notches, bool horizontal);
 void rdp_send_key_scancode(RdpSession *session, uint16_t scancode, bool down);
 void rdp_send_unicode_char(RdpSession *session, uint16_t codepoint, bool down);
 void rdp_send_ctrl_alt_del(RdpSession *session);

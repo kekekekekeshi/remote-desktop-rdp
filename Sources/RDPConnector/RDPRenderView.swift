@@ -31,8 +31,8 @@ struct RDPRenderView: NSViewRepresentable {
         view.onMouseButton = { [weak controller] button, down, x, y in
             controller?.sendMouseButton(button, down: down, x: x, y: y)
         }
-        view.onMouseWheel = { [weak controller] delta, x, y in
-            controller?.sendMouseWheel(delta: delta, x: x, y: y)
+        view.onMouseWheel = { [weak controller] delta, horizontal, x, y in
+            controller?.sendMouseWheel(delta: delta, x: x, y: y, horizontal: horizontal)
         }
         view.onKey = { [weak controller] scancode, down in
             controller?.sendKey(scancode: scancode, down: down)

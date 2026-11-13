@@ -15,7 +15,8 @@ public final class RDPRenderNSView: NSView {
 
     public var onMouseMove: ((UInt16, UInt16) -> Void)?
     public var onMouseButton: ((Int32, Bool, UInt16, UInt16) -> Void)?
-    public var onMouseWheel: ((Int32, UInt16, UInt16) -> Void)?
+    /// 滚轮：(格数, 是否横向, x, y)。格数为正表示向上 / 向右。
+    public var onMouseWheel: ((Int32, Bool, UInt16, UInt16) -> Void)?
     public var onKey: ((UInt16, Bool) -> Void)?
     public var onUnicode: ((UInt16, Bool) -> Void)?
 
@@ -211,11 +212,69 @@ public final class RDPRenderNSView: NSView {
         onMouseButton?(RDPMouseButton.middle, false, x, y)
     }
 
+    // MARK: - 滚轮 / 触摸板滚动
+
+    /// 触摸板的精确增量攒够多少像素算「一格」。
+    ///
+    /// RDP 只有整格的滚轮事件（一格 = 120 单位），而触摸板一次事件往往只有
+    /// 1~3 px。一个事件发一格会让远端滚动速度失控（快一个数量级），
+    /// 所以两轴都要攒够阈值再发。30 px/格大致对齐本地触摸板手感：
+    /// 远端滚得太快就调大，跟不上手就调小。
+    private static let pixelsPerWheelNotch: CGFloat = 30
+
+    /// 两轴各自「未满一格」的余量，用于跨事件累积
+    private var scrollRemainderX: CGFloat = 0
+    private var scrollRemainderY: CGFloat = 0
+
+    /// 两指滚动：两条轴都要转发。
+    ///
+    /// 只看 `scrollingDeltaY` 会让左右两指滑动彻底消失（RDP 侧靠
+    /// PTR_FLAGS_HWHEEL 区分横向，见 rdp_send_mouse_wheel）。
+    /// 对角线滚动两条轴各发各的，与本地行为一致。
     public override func scrollWheel(with event: NSEvent) {
         let (x, y) = remotePoint(from: event)
-        let delta = event.scrollingDeltaY
-        guard delta != 0 else { return }
-        onMouseWheel?(delta > 0 ? 1 : -1, x, y)
+        forwardScroll(event.scrollingDeltaX, horizontal: true, x: x, y: y, event: event)
+        forwardScroll(event.scrollingDeltaY, horizontal: false, x: x, y: y, event: event)
+    }
+
+    private func forwardScroll(_ delta: CGFloat, horizontal: Bool, x: UInt16, y: UInt16,
+                               event: NSEvent) {
+        var remainder = horizontal ? scrollRemainderX : scrollRemainderY
+
+        // 硬件滚轮：事件本身就是整格（hasPreciseScrollingDeltas == false），不参与累积
+        if delta != 0, !event.hasPreciseScrollingDeltas {
+            setRemainder(0, horizontal: horizontal)
+            onMouseWheel?(delta > 0 ? 1 : -1, horizontal, x, y)
+            return
+        }
+
+        if delta != 0 {
+            // 换向（或新手势开始）时丢掉旧余量：反向的零头相互抵消会表现为「纹丝不动」
+            if event.phase == .mayBegin || (remainder > 0) != (delta > 0) {
+                remainder = 0
+            }
+            remainder += delta
+            let notches = Int(remainder / Self.pixelsPerWheelNotch)  // 向零截断，符号即方向
+            remainder -= CGFloat(notches) * Self.pixelsPerWheelNotch
+            if notches != 0 {
+                onMouseWheel?(Int32(notches), horizontal, x, y)
+            }
+        }
+
+        // 惯性收尾 / 取消：补发不足一格的零头，否则最后一段滚动会被吞掉
+        let gestureEnds = event.phase == .ended || event.phase == .cancelled
+            || event.momentumPhase == .ended || event.momentumPhase == .cancelled
+        if gestureEnds {
+            if abs(remainder) >= Self.pixelsPerWheelNotch / 2 {
+                onMouseWheel?(remainder > 0 ? 1 : -1, horizontal, x, y)
+            }
+            remainder = 0
+        }
+        setRemainder(remainder, horizontal: horizontal)
+    }
+
+    private func setRemainder(_ value: CGFloat, horizontal: Bool) {
+        if horizontal { scrollRemainderX = value } else { scrollRemainderY = value }
     }
 
     // MARK: - 键盘
